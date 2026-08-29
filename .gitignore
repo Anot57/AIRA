@@ -1,0 +1,65 @@
+# General
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.orig
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Node / JS
+node_modules/
+.npm/
+
+# Flutter / Dart
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.metadata
+**/coverage/
+**/.idea/
+**/.vscode/
+**/.packages
+**/.pub-cache/
+**/.pub/
+**/android/local.properties
+**/ios/Flutter/Generated.xcconfig
+**/ios/Pods/
+**/windows/flutter/ephemeral/
+**/linux/flutter/ephemeral/
+**/macos/Flutter/GeneratedPluginRegistrant.swift
+
+# Backend / editor / OS
+.gitkeep
+*.sqlite3
+*.db
+.cache/
+.tmp/
+
+# Security and secrets
+secrets/
+keys/
+*.pem
+*.key
+*.crt
+
+# Azure / deployment output (not used in this task, but safe defaults)
+.azure/
+*.tfstate
+*.tfstate.*
