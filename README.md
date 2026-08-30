@@ -33,9 +33,11 @@ This repository currently contains the Android Flutter client at `apps/mobile`, 
 
 ## Current state
 
-- Android-only Flutter application scaffold exists in `apps/mobile`.
+- The Android-only Flutter application in `apps/mobile` includes a local mock
+  shell for onboarding, scheduling, settings, and simulated voice calls.
+- All milestone state is deterministic and in-memory; there are no backend,
+  microphone, authentication, payment, or external API integrations yet.
 - The app is expected to build and run on Android devices and emulators.
-- This task does not change the Flutter UI; it focuses on repository-level product, architecture, and governance documentation.
 
 ## Privacy and safety
 
@@ -52,7 +54,7 @@ The system must follow strict consent, privacy, and safety controls:
 - Do not add non-Android targets.
 - Do not install dependencies for this task.
 - Do not deploy anything.
-- Do not commit during this documentation-only phase.
+- Do not commit unless explicitly requested.
 
 ## Documentation
 
