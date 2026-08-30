@@ -1,17 +1,26 @@
-# female_voice_ai
+# Aira Android app
 
-A new Flutter project.
+This directory contains the Android-only Flutter client for Aira, a clearly
+identified AI voice companion. `Aira` is a temporary product name centralized
+in `lib/core/constants/app_copy.dart`.
 
-## Getting Started
+The current milestone is a completely local mock experience. Onboarding,
+scheduling, theme selection, memory consent, and simulated call state live only
+in memory. The app does not use a backend, microphone, authentication, payment,
+or network service.
 
-This project is a starting point for a Flutter application.
+## Run locally
 
-A few resources to get you started if this is your first Flutter project:
+From this directory:
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```sh
+flutter run
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Run the local checks with:
+
+```sh
+dart format --output=none --set-exit-if-changed lib test
+flutter analyze
+flutter test
+```
