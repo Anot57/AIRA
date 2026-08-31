@@ -35,9 +35,23 @@ This repository currently contains the Android Flutter client at `apps/mobile`, 
 
 - The Android-only Flutter application in `apps/mobile` includes a local mock
   shell for onboarding, scheduling, settings, and simulated voice calls.
+- Offline developer tooling in `services/local_voice_api` can run one complete
+  local Aanya audio turn without changing or connecting the Android UI.
 - All milestone state is deterministic and in-memory; there are no backend,
   microphone, authentication, payment, or external API integrations yet.
 - The app is expected to build and run on Android devices and emulators.
+
+## Local Aanya conversation test
+
+With the documented E-drive runtime already prepared, run Milestone 4C in WSL:
+
+```bash
+cd /mnt/e/female-voice-ai && source /mnt/e/aira-local-runtime/activate.sh && python services/local_voice_api/tools/run_local_conversation.py --companion aanya --audio /mnt/e/aira-local-runtime/input/amman_test.wav
+```
+
+This is local developer tooling for an explicitly identified adult fictional
+AI companion. See [services/local_voice_api/README.md](services/local_voice_api/README.md)
+for runtime, privacy, model-cache, and output details.
 
 ## Privacy and safety
 

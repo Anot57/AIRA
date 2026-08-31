@@ -28,9 +28,12 @@ PyTorch cache, and generated references on the E drive:
 /mnt/e/aira-local-runtime/generated/voices
 /mnt/e/aira-local-runtime/generated/runtime
 /mnt/e/aira-local-runtime/generated/transcripts
+/mnt/e/aira-local-runtime/generated/conversations
 /mnt/e/aira-local-runtime/models/faster-whisper
-/mnt/e/aira-local-models/huggingface
-/mnt/e/aira-local-models/torch
+/mnt/e/aira-local-runtime/llama/llama-b10715/llama-cli
+/mnt/e/aira-local-runtime/llama-cache
+/mnt/e/aira-local-runtime/huggingface
+/mnt/e/aira-local-runtime/torch
 ```
 
 The CLI refuses generation when its output or required runtime environment
@@ -44,27 +47,28 @@ These commands assume Ubuntu 24.04 in WSL and Python 3.12. Confirm that
 ```bash
 sudo apt update
 sudo apt install -y python3.12 python3.12-venv libsndfile1 sox
-mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime /mnt/e/aira-local-runtime/generated/transcripts /mnt/e/aira-local-runtime/models/faster-whisper
-mkdir -p /mnt/e/aira-local-models/huggingface/hub /mnt/e/aira-local-models/torch
+mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/cuda-cache /mnt/e/aira-local-runtime/huggingface/hub /mnt/e/aira-local-runtime/numba-cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/pycache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/torch /mnt/e/aira-local-runtime/torchinductor-cache /mnt/e/aira-local-runtime/triton-cache
+mkdir -p /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime /mnt/e/aira-local-runtime/generated/transcripts /mnt/e/aira-local-runtime/generated/conversations /mnt/e/aira-local-runtime/models/faster-whisper /mnt/e/aira-local-runtime/llama-cache
 python3.12 -m venv /mnt/e/aira-local-runtime/.venv
 cat > /mnt/e/aira-local-runtime/activate.sh <<'EOF'
 #!/usr/bin/env bash
 source /mnt/e/aira-local-runtime/.venv/bin/activate
-export HF_HOME=/mnt/e/aira-local-models/huggingface
-export HF_HUB_CACHE=/mnt/e/aira-local-models/huggingface/hub
-export HF_XET_CACHE=/mnt/e/aira-local-models/huggingface/xet
-export HF_ASSETS_CACHE=/mnt/e/aira-local-models/huggingface/assets
-export HF_MODULES_CACHE=/mnt/e/aira-local-models/huggingface/modules
-export HF_TOKEN_PATH=/mnt/e/aira-local-models/huggingface/token
-export TORCH_HOME=/mnt/e/aira-local-models/torch
+export HF_HOME=/mnt/e/aira-local-runtime/huggingface
+export HF_HUB_CACHE=/mnt/e/aira-local-runtime/huggingface/hub
+export HF_XET_CACHE=/mnt/e/aira-local-runtime/huggingface/xet
+export HF_ASSETS_CACHE=/mnt/e/aira-local-runtime/huggingface/assets
+export HF_MODULES_CACHE=/mnt/e/aira-local-runtime/huggingface/modules
+export HF_TOKEN_PATH=/mnt/e/aira-local-runtime/huggingface/token
+export TORCH_HOME=/mnt/e/aira-local-runtime/torch
 export XDG_CACHE_HOME=/mnt/e/aira-local-runtime/cache
 export PIP_CACHE_DIR=/mnt/e/aira-local-runtime/pip-cache
 export TMPDIR=/mnt/e/aira-local-runtime/tmp
-export CUDA_CACHE_PATH=/mnt/e/aira-local-runtime/cache/nvidia
-export NUMBA_CACHE_DIR=/mnt/e/aira-local-runtime/cache/numba
-export TORCHINDUCTOR_CACHE_DIR=/mnt/e/aira-local-runtime/cache/torchinductor
-export TRITON_CACHE_DIR=/mnt/e/aira-local-runtime/cache/triton
-export PYTHONPYCACHEPREFIX=/mnt/e/aira-local-runtime/cache/pycache
+export CUDA_CACHE_PATH=/mnt/e/aira-local-runtime/cuda-cache
+export NUMBA_CACHE_DIR=/mnt/e/aira-local-runtime/numba-cache
+export TORCHINDUCTOR_CACHE_DIR=/mnt/e/aira-local-runtime/torchinductor-cache
+export TRITON_CACHE_DIR=/mnt/e/aira-local-runtime/triton-cache
+export PYTHONPYCACHEPREFIX=/mnt/e/aira-local-runtime/pycache
+export LLAMA_CACHE=/mnt/e/aira-local-runtime/llama-cache
 EOF
 chmod 700 /mnt/e/aira-local-runtime/activate.sh
 source /mnt/e/aira-local-runtime/activate.sh
@@ -195,6 +199,35 @@ duration, timestamped segments, runtime settings, and a UTC timestamp under the
 E-drive transcript directory. Call `shutdown_transcription_runtime()` once at
 process shutdown to release the cached model; shutdown is terminal for that
 process.
+
+## Milestone 4C: one-command local conversation turn
+
+The conversation tool reuses the CPU Faster-Whisper runtime, the existing
+cached `Qwen3-1.7B-Q4_K_M.gguf` through llama.cpp, and the exact approved Aanya
+reference `aanya_seed_20260831.wav`. It does not scan for a newer voice
+reference, use a network LLM endpoint, or download an LLM. llama.cpp runs with
+offline mode, Qwen thinking disabled, and FlashAttention disabled. Approved
+voice synthesis retains the existing automatic RTX 2070/Turing
+`float32`/`eager` configuration.
+
+Run the first complete Aanya turn from WSL with this exact one-command example:
+
+```bash
+cd /mnt/e/female-voice-ai && source /mnt/e/aira-local-runtime/activate.sh && python services/local_voice_api/tools/run_local_conversation.py --companion aanya --audio /mnt/e/aira-local-runtime/input/amman_test.wav
+```
+
+Each run creates a unique directory below
+`/mnt/e/aira-local-runtime/generated/conversations`. The final WAV, component
+STT/TTS provenance, and `turn.json` remain there. `turn.json` records the input
+path, raw and Aanya-normalized transcripts, clean assistant response, output
+WAV, exact STT/LLM/TTS provenance, segment timestamps, UTC stage timestamps,
+and available audio/stage durations. Transcript and audio content are sensitive;
+keep the E drive encrypted at rest and delete test turns when they are no longer
+needed.
+
+Milestone 4C currently has a persona and an approved voice only for `aanya`.
+Name normalization changes the whole-word STT variants `Anna`, `Anya`, and
+`Ana` to `Aanya` only while Aanya is the active companion.
 
 ## Lightweight verification
 
