@@ -7,8 +7,12 @@ transcript identifies itself as AI, and no profile is intended to copy an
 existing person's voice.
 
 The Local Voice Lab is offline tooling only. It does not add an API server,
-connect to the Flutter app, or change the call screen. Reference audio and
-synthesis text remain local and are never uploaded by these tools.
+connect to the Flutter app, or change the call screen. Reference audio,
+synthesis text, transcription input, and transcript output remain local and are
+never uploaded by these tools. Because transcripts are intentionally saved as
+plain UTF-8 text and JSON, the Windows E drive must use encryption at rest
+(for example, BitLocker); files accessed through `/mnt/e` inherit that volume
+protection.
 
 ## Runtime layout
 
@@ -23,6 +27,8 @@ PyTorch cache, and generated references on the E drive:
 /mnt/e/aira-local-runtime/tmp
 /mnt/e/aira-local-runtime/generated/voices
 /mnt/e/aira-local-runtime/generated/runtime
+/mnt/e/aira-local-runtime/generated/transcripts
+/mnt/e/aira-local-runtime/models/faster-whisper
 /mnt/e/aira-local-models/huggingface
 /mnt/e/aira-local-models/torch
 ```
@@ -38,7 +44,7 @@ These commands assume Ubuntu 24.04 in WSL and Python 3.12. Confirm that
 ```bash
 sudo apt update
 sudo apt install -y python3.12 python3.12-venv libsndfile1 sox
-mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime
+mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime /mnt/e/aira-local-runtime/generated/transcripts /mnt/e/aira-local-runtime/models/faster-whisper
 mkdir -p /mnt/e/aira-local-models/huggingface/hub /mnt/e/aira-local-models/torch
 python3.12 -m venv /mnt/e/aira-local-runtime/.venv
 cat > /mnt/e/aira-local-runtime/activate.sh <<'EOF'
@@ -66,6 +72,7 @@ cd /mnt/e/female-voice-ai
 python -m pip install --upgrade pip
 python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r services/local_voice_api/requirements-runtime.txt
+python -m pip install -r services/local_voice_api/requirements-stt.txt
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CUDA unavailable')"
 ```
 
@@ -150,6 +157,44 @@ and one reusable voice-clone prompt per validated companion. Call
 model references and clear CUDA cache. Shutdown is terminal for that process.
 After a CUDA device-side assertion, do not retry synthesis in that process;
 change the Base precision/runtime settings and start a fresh process.
+
+## Milestone 3: private local speech-to-text
+
+Short conversational turns are transcribed locally with Faster-Whisper
+`base.en`. The reusable runtime uses CPU INT8 inference with six CPU threads and
+one worker, leaving the GPU and its VRAM available for Qwen TTS. It requests
+English, beam size 1, VAD filtering, and disables conditioning on previous text.
+
+Install the STT dependency separately so the existing Qwen/PyTorch environment
+is not replaced unnecessarily:
+
+```bash
+source /mnt/e/aira-local-runtime/activate.sh
+cd /mnt/e/female-voice-ai
+python -m pip install -r services/local_voice_api/requirements-stt.txt
+```
+
+Inspect all fixed settings and paths without importing Faster-Whisper:
+
+```bash
+python services/local_voice_api/tools/transcribe_audio.py --show-config
+```
+
+**The first real transcription downloads `base.en` into
+`/mnt/e/aira-local-runtime/models/faster-whisper`.** Configuration display and
+lightweight tests do not download or run the model.
+
+```bash
+python services/local_voice_api/tools/transcribe_audio.py --audio /mnt/e/aira-local-runtime/generated/runtime/aanya_runtime_seed_20260902_fc889e0ad1ec.wav --output-dir /mnt/e/aira-local-runtime/generated/transcripts --model-dir /mnt/e/aira-local-runtime/models/faster-whisper --cpu-threads 6
+```
+
+The runtime validates and hashes the source locally before model loading. It
+never uploads or copies the source audio. A successful run writes only a UTF-8
+transcript text file and JSON metadata containing provenance, language,
+duration, timestamped segments, runtime settings, and a UTC timestamp under the
+E-drive transcript directory. Call `shutdown_transcription_runtime()` once at
+process shutdown to release the cached model; shutdown is terminal for that
+process.
 
 ## Lightweight verification
 
