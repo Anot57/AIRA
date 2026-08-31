@@ -1,12 +1,14 @@
-# Local Voice Lab - milestone 1
+# Local Voice Lab
 
 This workspace designs short reference clips for the 20 checked-in Android
-companion IDs. Every profile is an original fictional adult AI voice, every
-reference transcript identifies itself as AI, and no profile is intended to
-copy an existing person's voice.
+companion IDs and reuses explicitly approved clips for local speech synthesis.
+Every profile is an original fictional adult AI voice, every reference
+transcript identifies itself as AI, and no profile is intended to copy an
+existing person's voice.
 
-Milestone 1 is an offline preparation tool only. It does not add an API server,
-connect to the Flutter app, or change the call screen.
+The Local Voice Lab is offline tooling only. It does not add an API server,
+connect to the Flutter app, or change the call screen. Reference audio and
+synthesis text remain local and are never uploaded by these tools.
 
 ## Runtime layout
 
@@ -20,6 +22,7 @@ PyTorch cache, and generated references on the E drive:
 /mnt/e/aira-local-runtime/pip-cache
 /mnt/e/aira-local-runtime/tmp
 /mnt/e/aira-local-runtime/generated/voices
+/mnt/e/aira-local-runtime/generated/runtime
 /mnt/e/aira-local-models/huggingface
 /mnt/e/aira-local-models/torch
 ```
@@ -35,7 +38,7 @@ These commands assume Ubuntu 24.04 in WSL and Python 3.12. Confirm that
 ```bash
 sudo apt update
 sudo apt install -y python3.12 python3.12-venv libsndfile1 sox
-mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/generated/voices
+mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime
 mkdir -p /mnt/e/aira-local-models/huggingface/hub /mnt/e/aira-local-models/torch
 python3.12 -m venv /mnt/e/aira-local-runtime/.venv
 cat > /mnt/e/aira-local-runtime/activate.sh <<'EOF'
@@ -66,12 +69,15 @@ python -m pip install -r services/local_voice_api/requirements-runtime.txt
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CUDA unavailable')"
 ```
 
-Do not install `flash-attn`. The tool uses standard PyTorch SDPA when available
-and selects eager attention when SDPA is unavailable. It always loads exactly
-one model, `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`, with `torch.float16` on
-`cuda:0`.
+Do not install `flash-attn`; neither runtime requires it. Reference design keeps
+its existing `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` runtime settings. Approved
+voice synthesis uses `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and selects its runtime by
+CUDA compute capability: GPUs below major 8, including RTX 20-series/Turing
+(7.5), use `torch.float32` with eager attention; GPUs at major 8 or newer use
+`torch.float16` with PyTorch SDPA. RTX 20-series FP32 compatibility mode is
+slower, but the 0.6B Base model is expected to fit within 8 GB VRAM.
 
-## Workflow
+## Milestone 1: voice reference design
 
 Listing profiles is dependency-light: it does not import `torch` or `qwen_tts`
 and does not access model weights.
@@ -99,6 +105,52 @@ file. Metadata records the companion ID, transcript, voice description, model
 ID, requested seed, returned sample rate, AI-generated and adult flags, and a
 UTC creation timestamp.
 
+## Milestone 2: approve and reuse a reference
+
+Approval is explicit. The checked-in
+`config/approved_voice_references.json` manifest contains relative filenames,
+never machine-specific absolute paths. It initially approves only these exact
+files for Aanya:
+
+```text
+aanya_seed_20260831.wav
+aanya_seed_20260831.json
+```
+
+Place both files in `/mnt/e/aira-local-runtime/generated/voices`. The runtime
+selects only the manifest filenames; it never scans for or silently chooses the
+newest reference. Before model loading it verifies the companion ID, seed,
+adult and AI-generated flags, nonempty transcript, VoiceDesign model ID,
+sample rate, metadata filename, and WAV filename and contents.
+
+List approvals without importing PyTorch, SoundFile, or Qwen:
+
+```bash
+source /mnt/e/aira-local-runtime/activate.sh
+cd /mnt/e/female-voice-ai
+python services/local_voice_api/tools/synthesize_companion_voice.py --list-approved
+```
+
+**The first synthesis downloads
+`Qwen/Qwen3-TTS-12Hz-0.6B-Base` into the E-drive Hugging Face cache.** It is not
+downloaded by listing approvals or running lightweight tests.
+
+```bash
+python services/local_voice_api/tools/synthesize_companion_voice.py --companion aanya --text "I'm glad you called. Tell me what happened, and we can think through it together." --reference-dir /mnt/e/aira-local-runtime/generated/voices --output-dir /mnt/e/aira-local-runtime/generated/runtime --seed 20260901
+```
+
+Synthesis accepts 1 to 500 characters. It creates a WAV and matching JSON with
+the companion ID, synthesized text, Base model ID, approved reference WAV and
+seed, output seed, returned sample rate, resolved dtype, attention backend,
+CUDA compute capability, adult and AI-generated flags, and UTC timestamp.
+
+Within a long-running Python process, the synthesis module keeps one Base model
+and one reusable voice-clone prompt per validated companion. Call
+`shutdown_voice_clone_runtime()` once at process shutdown to release prompt and
+model references and clear CUDA cache. Shutdown is terminal for that process.
+After a CUDA device-side assertion, do not retry synthesis in that process;
+change the Base precision/runtime settings and start a fresh process.
+
 ## Lightweight verification
 
 These checks use only the Python standard library and never import the model
@@ -108,6 +160,7 @@ runtime:
 source /mnt/e/aira-local-runtime/activate.sh
 cd /mnt/e/female-voice-ai
 python -m json.tool services/local_voice_api/config/voice_profiles.json >/dev/null
+python -m json.tool services/local_voice_api/config/approved_voice_references.json >/dev/null
 python -m compileall -q services/local_voice_api
 python -m unittest discover -s services/local_voice_api/tests -v
 ```
