@@ -29,6 +29,7 @@ PyTorch cache, and generated references on the E drive:
 /mnt/e/aira-local-runtime/generated/runtime
 /mnt/e/aira-local-runtime/generated/transcripts
 /mnt/e/aira-local-runtime/generated/conversations
+/mnt/e/aira-local-runtime/incoming
 /mnt/e/aira-local-runtime/models/faster-whisper
 /mnt/e/aira-local-runtime/llama/llama-b10715/llama-cli
 /mnt/e/aira-local-runtime/llama-cache
@@ -48,7 +49,7 @@ These commands assume Ubuntu 24.04 in WSL and Python 3.12. Confirm that
 sudo apt update
 sudo apt install -y python3.12 python3.12-venv libsndfile1 sox
 mkdir -p /mnt/e/aira-local-runtime/cache /mnt/e/aira-local-runtime/cuda-cache /mnt/e/aira-local-runtime/huggingface/hub /mnt/e/aira-local-runtime/numba-cache /mnt/e/aira-local-runtime/pip-cache /mnt/e/aira-local-runtime/pycache /mnt/e/aira-local-runtime/tmp /mnt/e/aira-local-runtime/torch /mnt/e/aira-local-runtime/torchinductor-cache /mnt/e/aira-local-runtime/triton-cache
-mkdir -p /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime /mnt/e/aira-local-runtime/generated/transcripts /mnt/e/aira-local-runtime/generated/conversations /mnt/e/aira-local-runtime/models/faster-whisper /mnt/e/aira-local-runtime/llama-cache
+mkdir -p /mnt/e/aira-local-runtime/generated/voices /mnt/e/aira-local-runtime/generated/runtime /mnt/e/aira-local-runtime/generated/transcripts /mnt/e/aira-local-runtime/generated/conversations /mnt/e/aira-local-runtime/incoming /mnt/e/aira-local-runtime/models/faster-whisper /mnt/e/aira-local-runtime/llama-cache
 python3.12 -m venv /mnt/e/aira-local-runtime/.venv
 cat > /mnt/e/aira-local-runtime/activate.sh <<'EOF'
 #!/usr/bin/env bash
@@ -228,6 +229,78 @@ needed.
 Milestone 4C currently has a persona and an approved voice only for `aanya`.
 Name normalization changes the whole-word STT variants `Anna`, `Anya`, and
 `Ana` to `Aanya` only while Aanya is the active companion.
+
+## Milestone 5A: trusted local HTTP bridge
+
+Milestone 5A exposes the existing one-turn orchestration to a future Android
+push-to-talk client. The API does not recreate or alter STT, llama.cpp, or TTS:
+it stores a validated upload and calls `run_conversation_turn()` once. Flutter
+is not connected yet.
+
+Install only the HTTP bridge dependencies into the existing E-drive runtime:
+
+```bash
+cd /mnt/e/female-voice-ai && source /mnt/e/aira-local-runtime/activate.sh && python -m pip install -r services/local_voice_api/requirements-api.txt
+```
+
+Start the single-worker development server on the required host and port:
+
+```bash
+cd /mnt/e/female-voice-ai && source /mnt/e/aira-local-runtime/activate.sh && python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 8765
+```
+
+`0.0.0.0` listens on every local interface. This server has no authentication
+or TLS and is only for a trusted local-network development setup. Never expose
+or port-forward port 8765 to the public internet, do not use it on an untrusted
+network, and keep the host firewall enabled. For same-machine testing only,
+override the bind address with `--host 127.0.0.1`.
+
+In another WSL shell, check the dependency-light health endpoint. It does not
+load Whisper, llama.cpp, Qwen TTS, CUDA, or model files:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8765/health
+```
+
+Expected JSON:
+
+```json
+{"status":"ok","service":"aira-local-voice-api"}
+```
+
+Run the first real HTTP Aanya turn with:
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8765/v1/conversation/turn -F 'companion=aanya' -F 'audio=@/mnt/e/aira-local-runtime/input/amman_test.wav;type=audio/wav'
+```
+
+A successful response contains the safe turn ID, raw and normalized transcript,
+plain assistant response, explicit AI disclosure, and a process-local audio URL:
+
+```json
+{
+  "ai_disclosure": "Aanya is an adult fictional AI companion, not a human.",
+  "turn_id": "aanya_turn_...",
+  "companion": "aanya",
+  "raw_transcript": "...",
+  "normalized_transcript": "...",
+  "response": "...",
+  "audio_url": "/v1/conversation/turns/aanya_turn_.../audio"
+}
+```
+
+Uploads are streamed with a 50 MiB limit into uniquely named files under
+`/mnt/e/aira-local-runtime/incoming`; supplied filenames are never used as
+filesystem paths. Extensions, media types, and basic file signatures are
+checked before model work. Partial, rejected, and failed-turn uploads are
+removed. Successful uploads remain beside the existing generated conversation
+artifacts so `turn.json` provenance stays valid. Treat all of these files as
+sensitive and keep the E drive encrypted at rest.
+
+Generated WAV paths are stored in a locked in-memory registry and never accepted
+from an HTTP request. Audio URLs therefore work only for turns completed by the
+current server process and return 404 after a restart. Turn IDs are validated
+and never joined to a request-supplied filesystem path.
 
 ## Lightweight verification
 

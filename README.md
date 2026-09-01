@@ -37,7 +37,10 @@ This repository currently contains the Android Flutter client at `apps/mobile`, 
   shell for onboarding, scheduling, settings, and simulated voice calls.
 - Offline developer tooling in `services/local_voice_api` can run one complete
   local Aanya audio turn without changing or connecting the Android UI.
-- All milestone state is deterministic and in-memory; there are no backend,
+- A local-development FastAPI bridge exposes that turn to a future Android
+  push-to-talk client; it is unauthenticated, local-network-only, and not yet
+  connected to Flutter. There is no deployed or production backend.
+- All Android milestone state remains deterministic and in-memory; there are no
   microphone, authentication, payment, or external API integrations yet.
 - The app is expected to build and run on Android devices and emulators.
 
@@ -51,7 +54,8 @@ cd /mnt/e/female-voice-ai && source /mnt/e/aira-local-runtime/activate.sh && pyt
 
 This is local developer tooling for an explicitly identified adult fictional
 AI companion. See [services/local_voice_api/README.md](services/local_voice_api/README.md)
-for runtime, privacy, model-cache, and output details.
+for runtime, privacy, model-cache, HTTP bridge, and output details. The HTTP
+server must never be exposed or port-forwarded to the public internet.
 
 ## Privacy and safety
 
