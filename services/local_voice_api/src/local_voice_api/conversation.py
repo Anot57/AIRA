@@ -20,6 +20,7 @@ from .generation import (
     OPTIONAL_CACHE_OVERRIDES,
     REQUIRED_E_DRIVE_ENVIRONMENT,
 )
+from .observability import TurnTiming, current_turn_timing
 from .synthesis import (
     BASE_MODEL_ID as TTS_MODEL_ID,
     DEFAULT_SYNTHESIS_SEED,
@@ -598,6 +599,34 @@ def generate_local_llm_response(
     )
 
 
+def validate_local_llm_runtime(
+    runtime_root: os.PathLike[str] | str = DEFAULT_RUNTIME_ROOT,
+    *,
+    llama_cli_path: os.PathLike[str] | str | None = None,
+    llama_cache_dir: os.PathLike[str] | str | None = None,
+) -> None:
+    """Validate the offline llama.cpp executable and cached GGUF without inference.
+
+    llama-cli is process-per-turn today, so there is no resident model to warm in
+    this module. This readiness step is deliberately a dependency/file check and
+    must not be interpreted as measured TTFT performance.
+    """
+
+    root = _resolve_runtime_root(runtime_root)
+    configure_runtime_environment(root)
+    _resolve_runtime_file(
+        llama_cli_path or root / "llama" / "llama-b10715" / "llama-cli",
+        runtime_root=root,
+        label="llama.cpp executable",
+    )
+    cache = _resolve_runtime_directory(
+        llama_cache_dir or root / "llama-cache",
+        runtime_root=root,
+        label="llama.cpp cache directory",
+    )
+    resolve_cached_llm_model(cache, runtime_root=root)
+
+
 def _segments_metadata(segments: Sequence[TranscriptSegment]) -> list[dict[str, Any]]:
     return [
         {"start": segment.start, "end": segment.end, "text": segment.text}
@@ -712,43 +741,48 @@ def run_conversation_turn(
     run_llm = generate_local_llm_response if llm_runner is None else llm_runner
     synthesize = synthesize_companion_voice if synthesizer is None else synthesizer
     monotonic_started = time.perf_counter()
+    timing = current_turn_timing() or TurnTiming(selected_turn_id)
 
     stage_started = time.perf_counter()
-    transcription = transcribe(
-        audio_path=resolved_audio,
-        output_dir=turn_dir / "transcription",
-        model_dir=resolved_stt_model_dir,
-        cpu_threads=cpu_threads,
-    )
+    with timing.bind(), timing.stage("stt_total"):
+        transcription = transcribe(
+            audio_path=resolved_audio,
+            output_dir=turn_dir / "transcription",
+            model_dir=resolved_stt_model_dir,
+            cpu_threads=cpu_threads,
+        )
     stt_duration = time.perf_counter() - stage_started
     transcribed_at = _utc_timestamp()
     raw_transcript = transcription.transcript
-    normalized_transcript = normalize_companion_transcript(
-        companion_id, raw_transcript
-    )
+    with timing.stage("transcript_normalization"):
+        normalized_transcript = normalize_companion_transcript(
+            companion_id, raw_transcript
+        )
 
     stage_started = time.perf_counter()
-    assistant_response = run_llm(
-        normalized_transcript,
-        system_persona=persona,
-        llama_cli_path=resolved_llama_cli,
-        model_path=resolved_model,
-        cache_dir=resolved_cache,
-        timeout_seconds=llm_timeout_seconds,
-        environ=runtime_environment,
-    )
-    assistant_response = validate_assistant_response(assistant_response)
+    with timing.bind(), timing.stage("llm_generation"):
+        assistant_response = run_llm(
+            normalized_transcript,
+            system_persona=persona,
+            llama_cli_path=resolved_llama_cli,
+            model_path=resolved_model,
+            cache_dir=resolved_cache,
+            timeout_seconds=llm_timeout_seconds,
+            environ=runtime_environment,
+        )
+        assistant_response = validate_assistant_response(assistant_response)
     llm_duration = time.perf_counter() - stage_started
     responded_at = _utc_timestamp()
 
     stage_started = time.perf_counter()
-    synthesis = synthesize(
-        companion_id=companion_id,
-        text=assistant_response,
-        reference_dir=resolved_reference_dir,
-        output_dir=turn_dir / "audio",
-        seed=tts_seed,
-    )
+    with timing.bind(), timing.stage("tts_total"):
+        synthesis = synthesize(
+            companion_id=companion_id,
+            text=assistant_response,
+            reference_dir=resolved_reference_dir,
+            output_dir=turn_dir / "audio",
+            seed=tts_seed,
+        )
     tts_duration = time.perf_counter() - stage_started
     synthesized_at = _utc_timestamp()
     output_wav_path = _resolve_runtime_file(
@@ -804,7 +838,9 @@ def run_conversation_turn(
         "transcript_segments": _segments_metadata(transcription.segments),
         "tts_reference": str(resolved_reference.wav_path),
     }
-    _write_turn_metadata(metadata_path, metadata)
+    with timing.stage("turn_metadata_write"):
+        _write_turn_metadata(metadata_path, metadata)
+    timing.milestone("conversation_total")
     return ConversationTurnResult(
         metadata_path=metadata_path,
         output_wav_path=output_wav_path,

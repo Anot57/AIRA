@@ -6,13 +6,13 @@ Every profile is an original fictional adult AI voice, every reference
 transcript identifies itself as AI, and no profile is intended to copy an
 existing person's voice.
 
-The Local Voice Lab is offline tooling only. It does not add an API server,
-connect to the Flutter app, or change the call screen. Reference audio,
-synthesis text, transcription input, and transcript output remain local and are
-never uploaded by these tools. Because transcripts are intentionally saved as
-plain UTF-8 text and JSON, the Windows E drive must use encryption at rest
-(for example, BitLocker); files accessed through `/mnt/e` inherit that volume
-protection.
+The model tools remain offline and never upload audio or transcripts. A
+separate FastAPI process exposes the Aanya-only HTTP prototype and a mock-tested
+realtime WebSocket foundation to a trusted local Android client. It has no
+authentication or TLS and must never be exposed publicly. Because transcripts
+are intentionally saved as plain UTF-8 text and JSON, the Windows E drive must
+use encryption at rest (for example, BitLocker); files accessed through
+`/mnt/e` inherit that volume protection.
 
 ## Runtime layout
 
@@ -301,6 +301,146 @@ Generated WAV paths are stored in a locked in-memory registry and never accepted
 from an HTTP request. Audio URLs therefore work only for turns completed by the
 current server process and return 404 after a restart. Turn IDs are validated
 and never joined to a request-supplied filesystem path.
+
+Known Faster-Whisper no-speech results return HTTP `422` with
+`error: "no_speech"`; unexpected runtime failures retain the path-safe generic
+`500` response.
+
+## Realtime foundation: readiness, warmup, and WebSocket v1
+
+`GET /health` remains the exact dependency-light liveness check documented
+above. `GET /ready` is separate, returns `Cache-Control: no-store`, and reports
+safe process-wide state for `stt`, `llm`, and `tts`. It returns `200` only when
+all configured warmup steps completed and `503` for `starting`, `warming`,
+`degraded`, or `failed`.
+
+Expensive startup warmup is **off by default**. Opt in explicitly for a local
+server process:
+
+```bash
+cd /mnt/e/female-voice-ai
+source /mnt/e/aira-local-runtime/activate.sh
+AIRA_MODEL_WARMUP=1 python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 8765
+```
+
+Warmup runs once in a worker thread without blocking liveness. With no realtime
+provider configured, it loads the CPU Faster-Whisper runtime, validates the
+local llama.cpp executable and cached GGUF without launching inference, then
+loads Qwen Base and creates the approved Aanya voice-clone prompt. Shutdown
+waits for an in-progress in-process model load because Python thread
+cancellation cannot safely stop it. Do not enable this switch during routine
+tests.
+
+### Pocket TTS realtime worker
+
+Pocket TTS 3.1.0 runs in its existing dedicated Windows Python 3.13 / PyTorch
+2.14 CPU environment. The WSL backend does not import it. A persistent,
+loopback-only worker loads the model once, loads the cached Aanya safetensors
+state once, and exposes health, readiness, cancellation, and length-prefixed
+streaming PCM. The worker never binds to a non-loopback address and the backend
+rejects a non-loopback worker URL. This is a local-development trust boundary,
+not a public service.
+
+Start the worker in Windows PowerShell:
+
+```powershell
+$env:PYTHONPATH="E:\female-voice-ai\services\local_voice_api\src"
+$env:AIRA_POCKET_TTS_VOICE_STATE="E:\aira-local-runtime\pocket-tts\aanya_voice.safetensors"
+$env:AIRA_POCKET_TTS_CACHE_ROOT="E:\aira-local-runtime\pocket-tts\cache"
+$env:AIRA_POCKET_TTS_OFFLINE="1"
+& "E:\aira-local-runtime\venvs\pocket-tts\Scripts\python.exe" -m local_voice_api.pocket_tts_worker --host 127.0.0.1 --port 8766
+```
+
+The HTTP and realtime paths remain unchanged unless the provider is explicitly
+selected. Start the WSL backend only after the worker reports ready:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8766/ready
+cd /mnt/e/female-voice-ai
+source /mnt/e/aira-local-runtime/activate.sh
+AIRA_REALTIME_TTS_PROVIDER=pocket_worker \
+AIRA_POCKET_TTS_WORKER_URL=http://127.0.0.1:8766 \
+AIRA_MODEL_WARMUP=1 \
+python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 8765
+```
+
+This localhost path requires WSL networking that can reach the Windows
+loopback service (for example WSL mirrored networking). It intentionally does
+not fall back to a LAN bind. If `/ready` fails from WSL, fix that local
+networking boundary rather than exposing the unauthenticated worker publicly.
+
+With the Pocket provider selected, the `tts` warmup component checks that the
+worker has both its model and cached Aanya state loaded and is reporting 24 kHz
+mono PCM16. A missing, loading, failed, or format-incompatible worker keeps
+backend readiness unavailable. `/ready` and each realtime handshake repeat the
+lightweight worker status/format probe, so a worker that exits after warmup is
+not advertised as currently usable. The Qwen HTTP conversation implementation
+is unchanged and remains available as before.
+
+The versioned endpoint is `ws://<trusted-host>:8765/v1/realtime`. The first text
+frame must be `session_start` with `protocol_version: 1`, `companion: "aanya"`,
+and mono 16 kHz `pcm_s16le`. Microphone samples then use binary frames, followed
+by versioned `end_of_turn`, `cancel_turn`, or `session_end` text events. A turn
+is limited to 2 MiB and each binary frame to 64 KiB.
+
+`session_ready` includes the explicit AI disclosure, the input format, the full
+readiness snapshot, and `can_process_turns`. A server without both ready models
+and an enabled inference processor reports `can_process_turns: false` and closes
+with WebSocket code `1013`; this is observable startup/unavailability, not a
+claim that inference is ready. Server turn events are `stt_partial`, `stt_final`,
+`thinking`, `text_delta`, `text_sentence`, `speaking`, `audio_chunk`,
+`turn_complete`, `recoverable_error`, and `fatal_error`. Each `audio_chunk` JSON
+header is immediately followed by its binary PCM16 frame. Output is mono PCM16
+at a declared 8–48 kHz rate, starts at sequence zero, and remains bounded to 64
+KiB per frame.
+
+The production app still uses the existing HTTP Aanya screen. No realtime
+processor is enabled by default. Explicitly selecting `pocket_worker` composes
+the existing bounded batch STT and complete-response llama.cpp adapters with
+the streaming Pocket synthesizer; no WebSocket protocol or Flutter behavior is
+changed. Pocket audio is forwarded as 24 kHz mono PCM16 as soon as each genuine
+`generate_audio_stream` chunk arrives. The worker is single-flight and rejects
+concurrent synthesis instead of creating an unbounded queue.
+
+Cancellation invalidates the adapter generation, closes the active stream, and
+sends the active turn ID to the worker. Both sides check cancellation between
+chunks, so already-cancelled/stale chunks are not forwarded to a new turn. The
+underlying Pocket call cannot be force-preempted while it is inside one model
+step, but the worker remains reusable after its generator unwinds.
+
+HTTP turns emit structured `[AIRA TIMING]` logs for request parsing, upload
+validation/write, audio readiness, STT, normalization, LLM, TTS, result
+validation, response construction, metadata writing, and totals when those
+boundaries are reached. Realtime `turn_complete.metrics` measures STT final,
+TTFT, first speakable text, first synthesized sample (`ttfas_ms`), first binary
+audio successfully sent (`ttfa_ms`), and total time from server `end_of_turn`.
+Logs contain generated IDs and numeric/safe fields, not audio or transcript text.
+
+The existing Qwen measurements remain: cold model load 202.8 seconds, cold full
+conversation about 329 seconds, and warm full conversation 104.956 seconds.
+The separate Pocket benchmark measured 128.86/130.81/152.59 ms
+min/median/max first playable TTS audio, 106.69 ms for the short phrase, and a
+median RTF of about 0.394. Those are TTS-only Windows CPU measurements, not an
+end-to-end Aira TTFA result. STT, process-per-turn llama.cpp, phrase availability,
+IPC, WebSocket delivery, and Android playback still must be measured together.
+
+For a manual end-to-end smoke test, provide a non-sensitive uncompressed 16 kHz
+mono PCM16 input WAV and run this after both readiness checks return HTTP 200:
+
+```bash
+cd /mnt/e/female-voice-ai
+source /mnt/e/aira-local-runtime/activate.sh
+curl --fail-with-body http://127.0.0.1:8765/health
+curl --fail-with-body http://127.0.0.1:8765/ready
+python services/local_voice_api/tools/smoke_realtime_websocket.py \
+  /mnt/e/aira-local-runtime/incoming/realtime-smoke-input.wav \
+  /mnt/e/aira-local-runtime/generated/realtime-smoke-output.wav
+```
+
+The diagnostic prints the client-observed first binary arrival and the server's
+`ttfas_ms`/`ttfa_ms` metrics, then writes the streamed output WAV for listening.
+It uses only the standard library and performs real STT, LLM, and TTS; do not run
+it as part of automated tests.
 
 ## Lightweight verification
 

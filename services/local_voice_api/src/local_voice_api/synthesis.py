@@ -23,6 +23,7 @@ from .generation import (
     _seed_runtime,
     validate_e_drive_runtime,
 )
+from .observability import current_turn_timing
 
 BASE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 DEFAULT_REFERENCE_DIR = Path("/mnt/e/aira-local-runtime/generated/voices")
@@ -199,11 +200,16 @@ def _ensure_base_model() -> Any:
             "The voice synthesis runtime has been shut down. Start a new "
             "process before synthesizing again."
         )
+    timing = current_turn_timing()
     if _base_model is not None:
         if _base_runtime is None:
             raise VoiceSynthesisError(
                 "The cached Qwen Base model has no resolved runtime settings. "
                 "Start a fresh process before synthesizing again."
+            )
+        if timing is not None:
+            timing.record(
+                "qwen_base_model_load", 0.0, cold=False, cache_hit=True
             )
         return _base_model
 
@@ -226,12 +232,23 @@ def _ensure_base_model() -> Any:
     )
     numpy, soundfile, qwen_model_class = _load_model_dependencies()
     try:
-        model = qwen_model_class.from_pretrained(
-            BASE_MODEL_ID,
-            device_map="cuda:0",
-            dtype=runtime.dtype,
-            attn_implementation=runtime.attention_backend,
-        )
+        if timing is None:
+            model = qwen_model_class.from_pretrained(
+                BASE_MODEL_ID,
+                device_map="cuda:0",
+                dtype=runtime.dtype,
+                attn_implementation=runtime.attention_backend,
+            )
+        else:
+            with timing.stage(
+                "qwen_base_model_load", cold=True, cache_hit=False
+            ):
+                model = qwen_model_class.from_pretrained(
+                    BASE_MODEL_ID,
+                    device_map="cuda:0",
+                    dtype=runtime.dtype,
+                    attn_implementation=runtime.attention_backend,
+                )
     except Exception as error:
         if _is_cuda_assertion(error):
             _runtime_poisoned = True
@@ -264,14 +281,26 @@ def _get_voice_clone_prompt(
     signature = reference.cache_signature()
     companion_id = reference.approved.companion_id
     cached_prompt = _prompt_cache.get(companion_id)
-    if cached_prompt is not None and cached_prompt.signature == signature:
+    timing = current_turn_timing()
+    cache_hit = cached_prompt is not None and cached_prompt.signature == signature
+    if timing is not None:
+        timing.record("voice_prompt_cache_lookup", 0.0, cache_hit=cache_hit)
+    if cache_hit:
         return cached_prompt.prompt
 
-    prompt = model.create_voice_clone_prompt(
-        ref_audio=str(reference.wav_path),
-        ref_text=reference.transcript,
-        x_vector_only_mode=False,
-    )
+    if timing is None:
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=str(reference.wav_path),
+            ref_text=reference.transcript,
+            x_vector_only_mode=False,
+        )
+    else:
+        with timing.stage("voice_prompt_creation", cache_hit=False):
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=str(reference.wav_path),
+                ref_text=reference.transcript,
+                x_vector_only_mode=False,
+            )
     _prompt_cache[companion_id] = _CachedVoiceClonePrompt(
         signature=signature,
         prompt=prompt,
@@ -335,11 +364,22 @@ def synthesize_companion_voice(
                 )
             prompt = _get_voice_clone_prompt(model, reference)
             _seed_runtime(output_seed, _numpy_module, _torch_module)
-            waveforms, sample_rate = model.generate_voice_clone(
-                text=validated_text,
-                language="English",
-                voice_clone_prompt=prompt,
-            )
+            timing = current_turn_timing()
+            if timing is None:
+                waveforms, sample_rate = model.generate_voice_clone(
+                    text=validated_text,
+                    language="English",
+                    voice_clone_prompt=prompt,
+                )
+            else:
+                with timing.stage(
+                    "tts_generation", response_characters=len(validated_text)
+                ):
+                    waveforms, sample_rate = model.generate_voice_clone(
+                        text=validated_text,
+                        language="English",
+                        voice_clone_prompt=prompt,
+                    )
             if not waveforms:
                 raise VoiceSynthesisError("Qwen returned no synthesized waveform.")
 
@@ -348,13 +388,34 @@ def synthesize_companion_voice(
                 raise VoiceSynthesisError(
                     "Qwen returned an invalid synthesis sample rate."
                 )
-            _soundfile_module.write(
-                str(wav_path),
-                waveforms[0],
-                sample_rate,
-                format="WAV",
-                subtype="PCM_16",
-            )
+            if timing is None:
+                _soundfile_module.write(
+                    str(wav_path),
+                    waveforms[0],
+                    sample_rate,
+                    format="WAV",
+                    subtype="PCM_16",
+                )
+            else:
+                try:
+                    sample_count = len(waveforms[0])
+                except TypeError:
+                    # Keep timing instrumentation compatible with scalar-like
+                    # test/runtime containers accepted by SoundFile.
+                    sample_count = 1
+                audio_duration = sample_count / sample_rate
+                with timing.stage(
+                    "wav_serialization_write",
+                    audio_duration_seconds=round(audio_duration, 3),
+                    generated_sample_count=sample_count,
+                ):
+                    _soundfile_module.write(
+                        str(wav_path),
+                        waveforms[0],
+                        sample_rate,
+                        format="WAV",
+                        subtype="PCM_16",
+                    )
             metadata = {
                 "adult": True,
                 "ai_generated": True,
@@ -403,6 +464,26 @@ def synthesize_companion_voice(
             ) from error
         finally:
             waveforms = None
+
+
+def warmup_qwen_base_model() -> None:
+    """Load the process-wide CUDA Base model without generating speech."""
+
+    with _runtime_lock:
+        _ensure_base_model()
+
+
+def warmup_voice_clone_prompt(
+    companion_id: str = "aanya",
+    reference_dir: os.PathLike[str] | str = DEFAULT_REFERENCE_DIR,
+) -> None:
+    """Create and cache the approved voice prompt without synthesizing speech."""
+
+    validate_e_drive_runtime(reference_dir)
+    reference = load_validated_voice_reference(companion_id, reference_dir)
+    with _runtime_lock:
+        model = _ensure_base_model()
+        _get_voice_clone_prompt(model, reference)
 
 
 def shutdown_voice_clone_runtime() -> None:

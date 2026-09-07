@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import logging
 import math
 import os
 import posixpath
@@ -15,9 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .observability import current_turn_timing
+
 MODEL_NAME = "base.en"
-DEVICE = "cpu"
-COMPUTE_TYPE = "int8"
+DEVICE = os.environ.get("AIRA_STT_DEVICE", "cpu").strip().lower() or "cpu"
+COMPUTE_TYPE = (
+    os.environ.get("AIRA_STT_COMPUTE_TYPE", "int8").strip().lower() or "int8"
+)
 DEFAULT_CPU_THREADS = 6
 NUM_WORKERS = 1
 LANGUAGE = "en"
@@ -30,10 +35,15 @@ DEFAULT_TRANSCRIPT_OUTPUT_DIR = Path(
 )
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".ogg", ".webm"})
 MAX_INPUT_BYTES = 50 * 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
 
 
 class TranscriptionError(RuntimeError):
     """Raised for an actionable local transcription failure."""
+
+
+class NoSpeechError(TranscriptionError):
+    """Raised when a valid audio container contains no detectable speech."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,11 +262,16 @@ def _ensure_whisper_model(
             "The transcription runtime has been shut down. Start a fresh process "
             "before transcribing again."
         )
+    timing = current_turn_timing()
     if _whisper_model is not None:
         if configuration != _loaded_runtime_config:
             raise TranscriptionError(
                 "Faster-Whisper is already loaded with different model directory "
                 "or CPU thread settings. Start a fresh process to change them."
+            )
+        if timing is not None:
+            timing.record(
+                "stt_model_acquisition", 0.0, cold=False, cache_hit=True
             )
         return _whisper_model
 
@@ -266,14 +281,27 @@ def _ensure_whisper_model(
         else whisper_model_class
     )
     try:
-        model = model_class(
-            configuration.model_name,
-            device=configuration.device,
-            compute_type=configuration.compute_type,
-            cpu_threads=configuration.cpu_threads,
-            num_workers=configuration.num_workers,
-            download_root=str(configuration.model_dir),
-        )
+        if timing is None:
+            model = model_class(
+                configuration.model_name,
+                device=configuration.device,
+                compute_type=configuration.compute_type,
+                cpu_threads=configuration.cpu_threads,
+                num_workers=configuration.num_workers,
+                download_root=str(configuration.model_dir),
+            )
+        else:
+            with timing.stage(
+                "stt_model_acquisition", cold=True, cache_hit=False
+            ):
+                model = model_class(
+                    configuration.model_name,
+                    device=configuration.device,
+                    compute_type=configuration.compute_type,
+                    cpu_threads=configuration.cpu_threads,
+                    num_workers=configuration.num_workers,
+                    download_root=str(configuration.model_dir),
+                )
     except Exception as error:
         raise TranscriptionError(
             f"Could not load Faster-Whisper model {configuration.model_name!r} "
@@ -353,6 +381,108 @@ def _utc_timestamp() -> str:
     )
 
 
+
+def transcribe_pcm16_audio(
+    audio: bytes,
+    *,
+    sample_rate_hz: int,
+    channels: int,
+    model_dir: os.PathLike[str] | str = DEFAULT_MODEL_DIR,
+    cpu_threads: int = DEFAULT_CPU_THREADS,
+    whisper_model_class: Any | None = None,
+) -> str:
+    """Transcribe in-memory little-endian PCM16 for the realtime voice path."""
+
+    if not isinstance(audio, bytes):
+        raise TranscriptionError("Realtime PCM audio must be bytes.")
+
+    if channels != 1:
+        raise TranscriptionError(
+            f"Realtime transcription requires mono PCM; received {channels} channels."
+        )
+
+    if sample_rate_hz != 16000:
+        raise TranscriptionError(
+            "Realtime transcription requires 16000 Hz PCM; "
+            f"received {sample_rate_hz} Hz."
+        )
+
+    if not audio:
+        raise NoSpeechError("Realtime PCM audio contains no samples.")
+
+    if len(audio) % 2 != 0:
+        raise TranscriptionError(
+            "Realtime PCM16 audio must contain an even number of bytes."
+        )
+
+    try:
+        import numpy as np
+    except (ImportError, ModuleNotFoundError) as error:
+        raise TranscriptionError(
+            "NumPy is required for realtime in-memory transcription."
+        ) from error
+
+    pcm = np.frombuffer(audio, dtype="<i2")
+    if pcm.size == 0:
+        raise NoSpeechError("Realtime PCM audio contains no samples.")
+
+    waveform = pcm.astype(np.float32) / 32768.0
+
+    configuration = build_runtime_configuration(
+        model_dir=model_dir,
+        cpu_threads=cpu_threads,
+    )
+
+    with _runtime_lock:
+        model = _ensure_whisper_model(
+            configuration,
+            whisper_model_class,
+        )
+
+        try:
+            timing = current_turn_timing()
+
+            if timing is None:
+                segment_generator, _ = model.transcribe(
+                    waveform,
+                    language=LANGUAGE,
+                    beam_size=BEAM_SIZE,
+                    vad_filter=VAD_FILTER,
+                    condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                )
+                raw_segments = list(segment_generator)
+            else:
+                with timing.stage("stt_inference"):
+                    segment_generator, _ = model.transcribe(
+                        waveform,
+                        language=LANGUAGE,
+                        beam_size=BEAM_SIZE,
+                        vad_filter=VAD_FILTER,
+                        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                    )
+                    raw_segments = list(segment_generator)
+
+            segments = _normalize_segments(raw_segments)
+            transcript = " ".join(
+                segment.text for segment in segments
+            ).strip()
+
+            if not transcript:
+                raise NoSpeechError(
+                    "Faster-Whisper returned no speech; "
+                    "the realtime audio may be empty or silent."
+                )
+
+            return transcript
+
+        except NoSpeechError:
+            raise
+        except Exception as error:
+            raise TranscriptionError(
+                f"Faster-Whisper realtime PCM transcription failed: {error}"
+            ) from error
+
+
 def transcribe_audio(
     audio_path: os.PathLike[str] | str,
     output_dir: os.PathLike[str] | str = DEFAULT_TRANSCRIPT_OUTPUT_DIR,
@@ -391,18 +521,30 @@ def transcribe_audio(
         )
         model = _ensure_whisper_model(configuration, whisper_model_class)
         try:
-            segment_generator, info = model.transcribe(
-                str(resolved_audio),
-                language=LANGUAGE,
-                beam_size=BEAM_SIZE,
-                vad_filter=VAD_FILTER,
-                condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-            )
-            raw_segments = list(segment_generator)
+            timing = current_turn_timing()
+            if timing is None:
+                segment_generator, info = model.transcribe(
+                    str(resolved_audio),
+                    language=LANGUAGE,
+                    beam_size=BEAM_SIZE,
+                    vad_filter=VAD_FILTER,
+                    condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                )
+                raw_segments = list(segment_generator)
+            else:
+                with timing.stage("stt_inference"):
+                    segment_generator, info = model.transcribe(
+                        str(resolved_audio),
+                        language=LANGUAGE,
+                        beam_size=BEAM_SIZE,
+                        vad_filter=VAD_FILTER,
+                        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                    )
+                    raw_segments = list(segment_generator)
             segments = _normalize_segments(raw_segments)
             transcript = " ".join(segment.text for segment in segments).strip()
             if not transcript:
-                raise ValueError(
+                raise NoSpeechError(
                     "Faster-Whisper returned no speech; the audio may be empty or silent."
                 )
 
@@ -419,6 +561,8 @@ def transcribe_audio(
             duration = _finite_float(getattr(info, "duration", None), "Duration")
             if duration < 0:
                 raise ValueError("Duration must not be negative.")
+        except NoSpeechError:
+            raise
         except Exception as error:
             raise TranscriptionError(
                 f"Faster-Whisper transcription failed for {resolved_audio.name}: {error}"
@@ -488,6 +632,31 @@ def transcribe_audio(
             duration=duration,
             segments=segments,
         )
+
+
+def warmup_transcription_runtime(
+    model_dir: os.PathLike[str] | str = DEFAULT_MODEL_DIR,
+    cpu_threads: int = DEFAULT_CPU_THREADS,
+    *,
+    whisper_model_class: Any | None = None,
+) -> None:
+    """Load the configured CPU model once without transcribing any audio."""
+
+    threads = validate_cpu_threads(cpu_threads)
+    resolved_model_dir = validate_storage_directory(model_dir, "Model directory")
+    resolved_model_dir = _prepare_storage_directory(
+        resolved_model_dir, "Model directory"
+    )
+    configuration = TranscriptionRuntimeConfiguration(
+        model_name=MODEL_NAME,
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE,
+        cpu_threads=threads,
+        num_workers=NUM_WORKERS,
+        model_dir=resolved_model_dir,
+    )
+    with _runtime_lock:
+        _ensure_whisper_model(configuration, whisper_model_class)
 
 
 def shutdown_transcription_runtime() -> None:

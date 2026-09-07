@@ -31,6 +31,7 @@ from local_voice_api.conversation import (  # noqa: E402
     ConversationError,
     ConversationTurnResult,
 )
+from local_voice_api.transcription import NoSpeechError  # noqa: E402
 
 FORBIDDEN_RUNTIME_IMPORTS = {
     "cuda",
@@ -335,6 +336,44 @@ class LocalVoiceApiTests(unittest.TestCase):
         logged.assert_called_once()
         failing_runner.assert_called_once()
         self.assertEqual([], list((self.runtime_root / "incoming").iterdir()))
+
+    def test_known_no_speech_is_typed_and_recoverable_without_path_leak(self) -> None:
+        no_speech_runner = mock.Mock(
+            side_effect=NoSpeechError(
+                "private decoder detail at /mnt/e/aira-local-runtime/input.wav"
+            )
+        )
+        with self._client(runner=no_speech_runner) as client:
+            response = self._post_wav(client)
+
+        self.assertEqual(422, response.status_code)
+        self.assertEqual("no_speech", response.json()["error"])
+        self.assertIn("try again", response.json()["detail"].casefold())
+        self.assertNotIn("/mnt/e/", response.text)
+        no_speech_runner.assert_called_once()
+        self.assertEqual([], list((self.runtime_root / "incoming").iterdir()))
+
+    def test_http_turn_emits_bounded_stage_timing_without_content(self) -> None:
+        with self.assertLogs("local_voice_api.observability", level="INFO") as logs:
+            with self._client() as client:
+                response = self._post_wav(client)
+
+        self.assertEqual(200, response.status_code)
+        rendered = "\n".join(logs.output)
+        for stage in (
+            "request_received",
+            "multipart_parse",
+            "upload_validation",
+            "upload_write",
+            "audio_ready",
+            "conversation_pipeline",
+            "result_validation",
+            "response_json_construction",
+            "http_request_total",
+        ):
+            self.assertIn(f"stage={stage}", rendered)
+        self.assertNotIn("Hello Anna", rendered)
+        self.assertNotIn("should-not-be-used", rendered)
 
     def test_conversation_output_outside_runtime_root_is_rejected(self) -> None:
         outside_temporary_directory = tempfile.TemporaryDirectory(

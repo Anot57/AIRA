@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../features/call/aanya_voice_call_screen.dart';
 import '../features/call/mock_voice_call_screen.dart';
 import '../features/companions/data/companion_catalog.dart';
 import '../features/companions/data/local_companion_catalog.dart';
@@ -15,11 +16,13 @@ class AppShell extends StatefulWidget {
     required this.themeMode,
     required this.onThemeModeChanged,
     this.companionCatalog,
+    this.aanyaVoiceCallBuilder,
   });
 
   final ThemeMode themeMode;
   final ValueChanged<ThemeMode> onThemeModeChanged;
   final CompanionCatalog? companionCatalog;
+  final AanyaVoiceCallBuilder? aanyaVoiceCallBuilder;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -44,10 +47,20 @@ class _AppShellState extends State<AppShell> {
           onStartVoiceCall: () {
             Navigator.of(detailsContext).push(
               MaterialPageRoute<void>(
-                builder: (callContext) => MockVoiceCallScreen(
-                  companion: companion,
-                  onEnd: () => Navigator.of(callContext).pop(),
-                ),
+                builder: (callContext) {
+                  void onEnd() => Navigator.of(callContext).pop();
+                  if (companion.id == 'aanya' &&
+                      widget.aanyaVoiceCallBuilder != null) {
+                    return widget.aanyaVoiceCallBuilder!(
+                      companion: companion,
+                      onEnd: onEnd,
+                    );
+                  }
+                  return MockVoiceCallScreen(
+                    companion: companion,
+                    onEnd: onEnd,
+                  );
+                },
               ),
             );
           },

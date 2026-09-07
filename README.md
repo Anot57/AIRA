@@ -2,7 +2,10 @@
 
 Female Voice AI is an Android-first subscription app for a conversational AI companion with a natural female voice, low-latency interactions, scheduled conversations, and consent-based long-term memory.
 
-This repository currently contains the Android Flutter client at `apps/mobile`, with the plan to add a Python FastAPI service, PostgreSQL with pgvector, Redis, and LiveKit/WebRTC for real-time voice sessions.
+This repository contains the Android Flutter client at `apps/mobile` and a
+self-hosted local-development FastAPI voice service under
+`services/local_voice_api`. PostgreSQL, Redis, and production realtime
+transport remain future work.
 
 ## Product guardrails
 
@@ -33,15 +36,22 @@ This repository currently contains the Android Flutter client at `apps/mobile`, 
 
 ## Current state
 
-- The Android-only Flutter application in `apps/mobile` includes a local mock
-  shell for onboarding, scheduling, settings, and simulated voice calls.
+- The Android-only Flutter application in `apps/mobile` includes onboarding,
+  scheduling, settings, 20 companions, and an Aanya-only local push-to-talk
+  prototype. The other 19 voice-call screens remain deterministic mocks.
 - Offline developer tooling in `services/local_voice_api` can run one complete
   local Aanya audio turn without changing or connecting the Android UI.
-- A local-development FastAPI bridge exposes that turn to a future Android
-  push-to-talk client; it is unauthenticated, local-network-only, and not yet
-  connected to Flutter. There is no deployed or production backend.
-- All Android milestone state remains deterministic and in-memory; there are no
-  microphone, authentication, payment, or external API integrations yet.
+- A local-development FastAPI bridge exposes that turn to the Android client;
+  it is unauthenticated, trusted-LAN-only, and must never be exposed publicly.
+  There is no deployed or production backend.
+- A versioned `/v1/realtime` WebSocket, readiness/warmup infrastructure,
+  streaming adapter contracts, server timing, and a bounded Flutter realtime
+  client now form a mock-tested foundation. Production inference adapters,
+  streaming microphone/playback wiring, and device TTFA measurements are not
+  complete; the current Aanya screen intentionally still uses the HTTP path.
+- Aanya's debug flow records a temporary microphone WAV and plays the generated
+  local response. UI session history remains in memory; there is no persistent
+  conversational memory, authentication, payment, or paid API integration.
 - The app is expected to build and run on Android devices and emulators.
 
 ## Local Aanya conversation test
@@ -78,4 +88,5 @@ The system must follow strict consent, privacy, and safety controls:
 
 - [docs/architecture.md](docs/architecture.md)
 - [docs/mvp-plan.md](docs/mvp-plan.md)
+- [docs/realtime-voice-architecture.md](docs/realtime-voice-architecture.md)
 - [AGENTS.md](AGENTS.md)

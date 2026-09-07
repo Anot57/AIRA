@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/constants/app_copy.dart';
 import '../core/theme/app_theme.dart';
+import '../features/call/aanya_voice_call_screen.dart';
 import '../features/companions/data/companion_catalog.dart';
 import '../features/onboarding/onboarding_screen.dart';
 import 'app_shell.dart';
@@ -11,6 +12,7 @@ class AiraApp extends StatefulWidget {
     super.key,
     this.initiallyOnboarded = false,
     this.companionCatalog,
+    this.aanyaVoiceCallBuilder,
   });
 
   /// Allows widget tests to exercise the post-onboarding shell directly.
@@ -19,6 +21,9 @@ class AiraApp extends StatefulWidget {
 
   /// Overrides the production asset catalog in deterministic widget tests.
   final CompanionCatalog? companionCatalog;
+
+  /// Injects the real Aanya route without constructing plugins in widget tests.
+  final AanyaVoiceCallBuilder? aanyaVoiceCallBuilder;
 
   @override
   State<AiraApp> createState() => _AiraAppState();
@@ -49,6 +54,7 @@ class _AiraAppState extends State<AiraApp> {
                 key: const ValueKey('app-shell'),
                 themeMode: _themeMode,
                 companionCatalog: widget.companionCatalog,
+                aanyaVoiceCallBuilder: widget.aanyaVoiceCallBuilder,
                 onThemeModeChanged: (themeMode) {
                   setState(() => _themeMode = themeMode);
                 },

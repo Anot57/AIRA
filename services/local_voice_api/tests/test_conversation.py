@@ -38,6 +38,7 @@ from local_voice_api.conversation import (  # noqa: E402
     normalize_companion_transcript,
     resolve_cached_llm_model,
 )
+from local_voice_api.observability import TurnTiming  # noqa: E402
 from local_voice_api.synthesis import (  # noqa: E402
     BASE_MODEL_ID as TTS_MODEL_ID,
     DEFAULT_SYNTHESIS_SEED,
@@ -428,8 +429,9 @@ class ConversationPipelineTests(ConversationRuntimeFixture):
         llm_runner = mock.Mock(side_effect=fake_llm)
         synthesizer = mock.Mock(side_effect=fake_synthesize)
         turn_id = "aanya_turn_unit_test"
+        timing = TurnTiming(turn_id)
 
-        with mock.patch.dict(
+        with timing.bind(), mock.patch.dict(
             conversation_module.os.environ, self.environment, clear=True
         ):
             result = conversation_module.run_conversation_turn(
@@ -441,6 +443,18 @@ class ConversationPipelineTests(ConversationRuntimeFixture):
                 llm_runner=llm_runner,
                 synthesizer=synthesizer,
             )
+
+        measured_stages = {measurement.stage for measurement in timing.snapshot()}
+        self.assertTrue(
+            {
+                "stt_total",
+                "transcript_normalization",
+                "llm_generation",
+                "tts_total",
+                "turn_metadata_write",
+                "conversation_total",
+            }.issubset(measured_stages)
+        )
 
         turn_dir = self.output_dir / turn_id
         self.assertEqual(raw_transcript, result.raw_transcript)

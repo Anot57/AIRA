@@ -61,7 +61,7 @@ abstract final class AppCopy {
   static const String memoryOptInTitle = 'Allow long-term memory';
   static const String memoryOptInDescription =
       'Choose whether $productName may remember selected details in a future '
-      'version. This local mock does not store conversation content.';
+      'version. This prototype does not provide persistent conversation memory.';
   static const String viewMemoryLabel = 'View memory';
   static const String viewMemoryPlaceholder =
       'No memories are stored in this local mock.';
@@ -70,8 +70,8 @@ abstract final class AppCopy {
       'There is no saved memory to delete.';
   static const String privacySectionTitle = 'Privacy';
   static const String privacySummary =
-      'This milestone runs completely on-device with no account, microphone, '
-      'backend, or network connection.';
+      'Aanya voice turns send temporary microphone audio only to your trusted '
+      'local Aira service. No cloud account or long-term memory is used.';
   static const String aiDisclosureTitle = 'About this AI';
   static const String aiDisclosureBody =
       '$productName is artificial intelligence, not a person. It cannot '

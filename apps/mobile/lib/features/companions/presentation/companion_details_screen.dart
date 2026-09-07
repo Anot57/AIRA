@@ -86,8 +86,8 @@ class CompanionDetailsScreen extends StatelessWidget {
                           accent: colors.secondary,
                           child: Text(
                             'Long-term memory is optional and off by default. '
-                            'This local preview stores no conversation or '
-                            'memory data.',
+                            'This prototype does not provide persistent '
+                            'conversation memory.',
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: colors.onSurfaceVariant,
                             ),
@@ -123,7 +123,9 @@ class CompanionDetailsScreen extends StatelessWidget {
                 width: double.infinity,
                 child: Semantics(
                   button: true,
-                  label: 'Start a local mock voice call with ${companion.name}',
+                  label: companion.id == 'aanya'
+                      ? 'Start a local AI voice call with Aanya'
+                      : 'Start a mock AI voice call with ${companion.name}',
                   onTap: onStartVoiceCall,
                   child: ExcludeSemantics(
                     child: FilledButton.icon(
