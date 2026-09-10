@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
 from collections.abc import Callable, Mapping
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -28,6 +30,11 @@ from .realtime_session import RealtimeSession, RealtimeSessionState, RealtimeTur
 from .streaming import NoSpeechDetectedError, RealtimeInferenceUnavailableError
 
 _LOGGER = logging.getLogger(__name__)
+_CANCEL_CLEANUP_TIMEOUT_SECONDS = 0.25
+
+
+def _monotonic_us() -> int:
+    return time.monotonic_ns() // 1_000
 
 
 class _WebSocketSink(RealtimeEventSink):
@@ -40,18 +47,36 @@ class _WebSocketSink(RealtimeEventSink):
         self._websocket = websocket
         self._session = session
         self._send_lock = send_lock
+        self._cancelled_turn_ids: set[str] = set()
+        self._pending_audio_should_send: bool | None = None
+
+    def cancel_turn(self, turn_id: str | None) -> None:
+        if turn_id is not None:
+            self._cancelled_turn_ids.add(turn_id)
 
     async def send_json(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
-        if event_type == ServerEventType.THINKING.value:
-            self._session.mark_thinking()
-        elif event_type == ServerEventType.SPEAKING.value:
-            self._session.mark_speaking()
         async with self._send_lock:
+            turn_id = event.get("turn_id")
+            cancelled = (
+                isinstance(turn_id, str) and turn_id in self._cancelled_turn_ids
+            )
+            if event_type == ServerEventType.AUDIO_CHUNK.value:
+                self._pending_audio_should_send = not cancelled
+            if cancelled:
+                return
+            if event_type == ServerEventType.THINKING.value:
+                self._session.mark_thinking()
+            elif event_type == ServerEventType.SPEAKING.value:
+                self._session.mark_speaking()
             await self._websocket.send_json(event)
 
     async def send_audio(self, audio: bytes) -> None:
         async with self._send_lock:
+            should_send = self._pending_audio_should_send
+            self._pending_audio_should_send = None
+            if should_send is False:
+                return
             await self._websocket.send_bytes(audio)
 
 
@@ -68,19 +93,29 @@ class RealtimeWebSocketHandler:
         ),
         inference_available: bool = False,
         readiness_probe: Callable[[], None] | None = None,
+        capacity_snapshot: Callable[[], Mapping[str, object]] | None = None,
     ) -> None:
         self._websocket = websocket
         self._readiness_snapshot = readiness_snapshot
         self._processor = processor_factory()
         self._inference_available = inference_available
         self._readiness_probe = readiness_probe
+        self._capacity_snapshot = capacity_snapshot
         self._session = RealtimeSession()
         self._send_lock = asyncio.Lock()
         self._sink = _WebSocketSink(websocket, self._session, self._send_lock)
         self._turn_task: asyncio.Task[None] | None = None
+        self._connection_id = f"connection_{uuid.uuid4().hex}"
 
     async def run(self) -> None:
         await self._websocket.accept()
+        _LOGGER.info(
+            "[AIRA REALTIME TIMING] event=websocket_accepted connection_id=%s "
+            "session_id=%s generation=0 monotonic_us=%d",
+            self._connection_id,
+            self._session.session_id,
+            _monotonic_us(),
+        )
         try:
             if not await self._receive_session_start():
                 return
@@ -135,6 +170,7 @@ class RealtimeWebSocketHandler:
                 )
             self._session.start(event.companion, event.audio_format)
             self._session.begin_listening()
+            self._log_session_timing("session_start_received")
         except ProtocolError as error:
             # Before a session exists there is no recoverable state to return
             # to. Close deterministically instead of entering the main loop in
@@ -177,6 +213,16 @@ class RealtimeWebSocketHandler:
         can_process_turns = (
             self._inference_available and readiness.get("status") == "ready"
         )
+        if self._capacity_snapshot is not None:
+            try:
+                readiness["queues"] = dict(
+                    await asyncio.to_thread(self._capacity_snapshot)
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Realtime capacity snapshot unavailable connection_id=%s",
+                    self._connection_id,
+                )
         await self._send_json(
             server_event(
                 ServerEventType.SESSION_READY,
@@ -188,6 +234,7 @@ class RealtimeWebSocketHandler:
                 can_process_turns=can_process_turns,
             )
         )
+        self._log_session_timing("session_ready_sent")
         if not can_process_turns:
             self._session.close()
             await self._websocket.close(code=1013)
@@ -199,6 +246,14 @@ class RealtimeWebSocketHandler:
         if binary is not None:
             try:
                 self._session.push_audio(binary)
+                _LOGGER.debug(
+                    "Realtime input frame connection_id=%s session_id=%s bytes=%d buffered_bytes=%d received_at=%.6f",
+                    self._connection_id,
+                    self._session.session_id,
+                    len(binary),
+                    self._session.buffered_audio_bytes,
+                    time.monotonic(),
+                )
             except ProtocolError as error:
                 await self._send_error(error)
                 if error.code == "turn_audio_too_large":
@@ -238,6 +293,34 @@ class RealtimeWebSocketHandler:
             if error.code == "no_speech":
                 self._session.recover_turn()
             return
+        _LOGGER.info(
+            "Realtime end_of_turn connection_id=%s session_id=%s turn_id=%s generation=%d input_chunks=%d input_bytes=%d first_audio_at=%.6f last_audio_at=%.6f end_of_turn_at=%.6f",
+            self._connection_id,
+            turn.session_id,
+            turn.turn_id,
+            turn.generation,
+            turn.input_chunk_count,
+            len(turn.audio),
+            turn.first_audio_received_at,
+            turn.last_audio_received_at,
+            turn.end_of_turn_received_at,
+        )
+        turn.metrics.log_event(
+            _LOGGER,
+            "websocket_turn_received",
+            session_id=turn.session_id,
+            generation=turn.generation,
+            input_chunks=turn.input_chunk_count,
+            input_bytes=len(turn.audio),
+        )
+        turn.metrics.log_event(
+            _LOGGER,
+            "end_of_turn_received",
+            session_id=turn.session_id,
+            generation=turn.generation,
+            input_chunks=turn.input_chunk_count,
+            input_bytes=len(turn.audio),
+        )
         if self._turn_task is not None and not self._turn_task.done():
             self._session.recover_turn()
             await self._send_error(
@@ -264,7 +347,7 @@ class RealtimeWebSocketHandler:
             await self._send_error(
                 ProtocolError(
                     "no_speech",
-                    "No clear speech was detected. Hold the button a little longer and try again.",
+                    "No clear speech was detected. Please speak a little longer; listening will continue automatically.",
                 )
             )
             self._recover_if_open()
@@ -292,14 +375,35 @@ class RealtimeWebSocketHandler:
         except ProtocolError as error:
             await self._send_error(error)
             return
+        self._sink.cancel_turn(turn_id)
         task = self._turn_task
         if task is not None and not task.done():
-            await self._processor.cancel()
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            cancel_task = asyncio.create_task(self._processor.cancel())
+            done, pending = await asyncio.wait(
+                {task, cancel_task},
+                timeout=_CANCEL_CLEANUP_TIMEOUT_SECONDS,
+            )
+            for pending_task in pending:
+                pending_task.cancel()
+            for completed in done:
+                try:
+                    completed.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    _LOGGER.warning(
+                        "Realtime cancellation hook failed session_id=%s turn_id=%s",
+                        self._session.session_id,
+                        turn_id,
+                    )
+            if pending:
+                _LOGGER.warning(
+                    "Realtime cancellation cleanup timed out session_id=%s turn_id=%s",
+                    self._session.session_id,
+                    turn_id,
+                )
+        self._turn_task = None
         await self._send_json(
             server_event(
                 ServerEventType.RECOVERABLE_ERROR,
@@ -365,3 +469,14 @@ class RealtimeWebSocketHandler:
     async def _send_json(self, event: dict[str, object]) -> None:
         async with self._send_lock:
             await self._websocket.send_json(event)
+
+    def _log_session_timing(self, event: str) -> None:
+        _LOGGER.info(
+            "[AIRA REALTIME TIMING] event=%s connection_id=%s session_id=%s "
+            "generation=%d monotonic_us=%d",
+            event,
+            self._connection_id,
+            self._session.session_id,
+            self._session.turn_generation,
+            _monotonic_us(),
+        )

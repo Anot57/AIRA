@@ -187,7 +187,8 @@ void main() {
       ..beginTurn()
       ..sendPcm16Chunk(Uint8List.fromList(<int>[0, 0]));
 
-    expect(await client.cancelTurn(), isTrue);
+    final cancellation = client.cancelTurn();
+    await _flushEvents();
     expect(client.state.phase, AanyaRealtimePhase.cancelling);
     expect(client.state.canStartTurn, isFalse);
     socket.sendServerJson(<String, Object?>{
@@ -198,6 +199,7 @@ void main() {
     });
     await _flushEvents();
 
+    expect(await cancellation, isTrue);
     expect(_sentTypes(socket), contains('cancel_turn'));
     expect(client.state.phase, AanyaRealtimePhase.ready);
     expect(client.state.errorCode, isNull);
@@ -271,8 +273,193 @@ void main() {
 
     expect(client.state.phase, AanyaRealtimePhase.error);
     expect(client.state.errorCode, 'invalid_sentence_sequence');
+    expect(client.lastProtocolViolation?.code, 'invalid_sentence_sequence');
+    expect(client.lastProtocolViolation?.expectedEvent, 'text_sentence');
+    expect(client.lastProtocolViolation?.receivedEvent, 'text_sentence');
+    expect(client.lastProtocolViolation?.expectedSequence, 1);
+    expect(client.lastProtocolViolation?.receivedSequence, 2);
+    expect(client.lastProtocolViolation?.sessionId, 'session-1');
+    expect(client.lastProtocolViolation?.turnId, 'turn-1');
+    expect(client.lastProtocolViolation?.textSequence, 1);
+    expect(client.lastProtocolViolation?.audioSequence, 0);
     expect(socket.closeCode, 1002);
   });
+
+  test('identifies the former standalone-whitespace math failure', () {
+    expect(
+      () => RealtimeServerEventParser.parse(
+        jsonEncode(<String, Object?>{
+          ..._turnEvent('text_delta'),
+          'delta': '\n',
+        }),
+      ),
+      throwsA(
+        isA<RealtimeProtocolException>().having(
+          (error) => error.code,
+          'code',
+          'invalid_delta',
+        ),
+      ),
+    );
+    for (final delta in <String>[
+      '2 + 2',
+      'sqrt(2)',
+      '√2\n≈ 1.41421356',
+      'Pi is approximately 3.14159.',
+      '10 / 3',
+      '2^10 = 1024',
+      '-2.75',
+      '10.25%',
+      '**Calculation:**\n10 ÷ 4 = 2.5',
+    ]) {
+      expect(
+        RealtimeServerEventParser.parse(
+          jsonEncode(<String, Object?>{
+            ..._turnEvent('text_delta'),
+            'delta': delta,
+          }),
+        ),
+        isA<RealtimeTextDeltaEvent>(),
+      );
+    }
+  });
+
+  test('records safe diagnostics for a standalone whitespace delta', () async {
+    final socket = _FakeSocket();
+    final client = await _readyClient(socket);
+    addTearDown(() async {
+      client.dispose();
+      await client.shutdownComplete;
+    });
+    client
+      ..beginTurn()
+      ..sendPcm16Chunk(Uint8List.fromList(<int>[0, 0]))
+      ..endTurn();
+
+    socket.sendServerJson(_turnEvent('text_delta', delta: '\n'));
+    await _flushEvents();
+
+    expect(client.state.errorCode, 'invalid_delta');
+    expect(client.lastProtocolViolation?.code, 'invalid_delta');
+    expect(client.lastProtocolViolation?.expectedEvent, 'valid_server_event');
+    expect(client.lastProtocolViolation?.receivedEvent, 'text_delta');
+    expect(client.lastProtocolViolation?.turnId, 'turn-1');
+    expect(client.lastProtocolViolation?.sessionId, 'session-1');
+    expect(client.lastProtocolViolation?.textSequence, 1);
+    expect(client.lastProtocolViolation?.audioSequence, 0);
+  });
+
+  test(
+    'cancel timeout closes the old socket and creates a fresh session',
+    () async {
+      final first = _FakeSocket();
+      final second = _FakeSocket();
+      final connector = _FakeConnector()
+        ..sockets.addAll(<_FakeSocket>[first, second]);
+      final client = _client(
+        connector,
+        cancelAckTimeout: const Duration(milliseconds: 20),
+      );
+      addTearDown(() async {
+        client.dispose();
+        await client.shutdownComplete;
+      });
+      await client.connect();
+      first.sendServerJson(_sessionReady());
+      await _flushEvents();
+      client.beginTurn();
+
+      expect(await client.cancelTurn(), isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await _flushEvents(8);
+
+      expect(first.closeCount, 1);
+      expect(first.closeCode, 1001);
+      expect(connector.connectCount, 2);
+      expect(_sentTypes(second), <String>['session_start']);
+      second.sendServerJson(_sessionReady(sessionId: 'session-2'));
+      await _flushEvents();
+      expect(client.state.phase, AanyaRealtimePhase.ready);
+      expect(client.state.sessionId, 'session-2');
+    },
+  );
+
+  test(
+    'stale output is suppressed while cancel waits for its acknowledgement',
+    () async {
+      final socket = _FakeSocket();
+      final client = await _readyClient(socket);
+      addTearDown(() async {
+        client.dispose();
+        await client.shutdownComplete;
+      });
+      client.beginTurn();
+      final cancellation = client.cancelTurn();
+      await _flushEvents();
+
+      socket
+        ..sendServerJson(_turnEvent('text_delta', delta: 'stale'))
+        ..sendServerBinary(<int>[1, 0])
+        ..sendServerJson(_turnEvent('turn_complete'))
+        ..sendServerJson(_cancelled(turnId: 'turn-1'));
+      await _flushEvents();
+
+      expect(await cancellation, isTrue);
+      expect(client.state.responseText, isEmpty);
+      expect(client.state.phase, AanyaRealtimePhase.ready);
+      expect(client.beginTurn(), isTrue);
+    },
+  );
+
+  test(
+    'one persistent client resets text and audio sequences for 20 math turns',
+    () async {
+      final socket = _FakeSocket();
+      final client = await _readyClient(socket);
+      addTearDown(() async {
+        client.dispose();
+        await client.shutdownComplete;
+      });
+      const responses = <String>[
+        '2 + 2',
+        'sqrt(2)',
+        '√2\n≈ 1.41421356',
+        'Pi is approximately 3.14159.',
+        '10 / 3',
+        '2^10 = 1024',
+        '-2.75',
+        '10.25%',
+        'Pi is approximately 3.14159. It is irrational.',
+        '**Calculation:**\n10 ÷ 4 = 2.5',
+      ];
+
+      for (var index = 0; index < 20; index += 1) {
+        final turnId = 'turn-${index + 1}';
+        final response = responses[index % responses.length];
+        expect(client.beginTurn(), isTrue);
+        expect(client.sendPcm16Chunk(Uint8List.fromList(<int>[0, 0])), isTrue);
+        expect(client.endTurn(), isTrue);
+        socket
+          ..sendServerJson(
+            _turnEvent('text_delta', turnId: turnId, delta: response),
+          )
+          ..sendServerJson(<String, Object?>{
+            ..._turnEvent('text_sentence', turnId: turnId, text: response),
+            'sequence': 1,
+          })
+          ..sendServerJson(_audioHeader(turnId: turnId))
+          ..sendServerBinary(<int>[1, 0, 2, 0])
+          ..sendServerJson(<String, Object?>{
+            ..._turnEvent('turn_complete', turnId: turnId),
+            'metrics': <String, Object?>{'ttfa_ms': 1.0},
+          });
+        await _flushEvents(8);
+        expect(client.state.phase, AanyaRealtimePhase.ready);
+        expect(client.state.responseText, response);
+        expect(client.lastProtocolViolation, isNull);
+      }
+    },
+  );
 
   test('reconnects once after an unexpected local connection loss', () async {
     final first = _FakeSocket();
@@ -307,7 +494,7 @@ void main() {
     expect(client.state.sessionId, 'session-2');
   });
 
-  test('background cancels the turn, closes, and resumes once', () async {
+  test('background visibility changes preserve the active socket and turn', () async {
     final first = _FakeSocket();
     final second = _FakeSocket();
     final connector = _FakeConnector()
@@ -326,18 +513,15 @@ void main() {
 
     await client.setForeground(false);
 
-    expect(_sentTypes(first), <String>[
-      'session_start',
-      'cancel_turn',
-      'session_end',
-    ]);
-    expect(first.closeCount, 1);
-    expect(client.state.phase, AanyaRealtimePhase.offline);
+    expect(_sentTypes(first), <String>['session_start']);
+    expect(first.closeCount, 0);
+    expect(client.state.phase, AanyaRealtimePhase.listening);
     expect(connector.connectCount, 1);
 
     await client.setForeground(true);
-    expect(connector.connectCount, 2);
-    expect(_sentTypes(second), <String>['session_start']);
+    expect(connector.connectCount, 1);
+    expect(_sentTypes(second), isEmpty);
+    expect(client.state.phase, AanyaRealtimePhase.listening);
   });
 
   test('dispose ends the session and suppresses future reconnects', () async {
@@ -390,6 +574,56 @@ void main() {
     expect(client.state.phase, AanyaRealtimePhase.error);
     expect(client.state.errorCode, 'audio_limit_exceeded');
   });
+
+  test(
+    'rejects announced byte length that does not match binary PCM',
+    () async {
+      final socket = _FakeSocket();
+      final client = await _readyClient(socket);
+      addTearDown(() async {
+        client.dispose();
+        await client.shutdownComplete;
+      });
+      client
+        ..beginTurn()
+        ..sendPcm16Chunk(Uint8List.fromList(<int>[0, 0]))
+        ..endTurn();
+      socket
+        ..sendServerJson(_audioHeader())
+        ..sendServerBinary(<int>[0, 0]);
+      await _flushEvents();
+
+      expect(client.state.phase, AanyaRealtimePhase.error);
+      expect(client.state.errorCode, 'unexpected_audio_frame');
+      expect(socket.closeCode, 1002);
+    },
+  );
+
+  test('rejects a playback sample-rate change during one turn', () async {
+    final socket = _FakeSocket();
+    final client = await _readyClient(socket);
+    addTearDown(() async {
+      client.dispose();
+      await client.shutdownComplete;
+    });
+    client
+      ..beginTurn()
+      ..sendPcm16Chunk(Uint8List.fromList(<int>[0, 0]))
+      ..endTurn();
+    socket
+      ..sendServerJson(_audioHeader())
+      ..sendServerBinary(<int>[10, 0, 20, 0])
+      ..sendServerJson(<String, Object?>{
+        ..._audioHeader(),
+        'sequence': 1,
+        'sample_rate_hz': 24000,
+      });
+    await _flushEvents();
+
+    expect(client.state.phase, AanyaRealtimePhase.error);
+    expect(client.state.errorCode, 'playback_sample_rate_changed');
+    expect(socket.closeCode, 1002);
+  });
 }
 
 AanyaRealtimeClient _client(
@@ -397,6 +631,7 @@ AanyaRealtimeClient _client(
   List<Duration> reconnectDelays = const <Duration>[],
   ReconnectDelay reconnectDelay = _immediateDelay,
   int maxTurnAudioBytes = AiraRealtimeProtocol.maxTurnAudioBytes,
+  Duration cancelAckTimeout = const Duration(milliseconds: 400),
 }) {
   return AanyaRealtimeClient(
     companionId: 'aanya',
@@ -406,6 +641,7 @@ AanyaRealtimeClient _client(
     reconnectDelays: reconnectDelays,
     reconnectDelay: reconnectDelay,
     maxTurnAudioBytes: maxTurnAudioBytes,
+    cancelAckTimeout: cancelAckTimeout,
   );
 }
 
@@ -436,20 +672,21 @@ List<String> _sentTypes(_FakeSocket socket) => socket.sentText
     )
     .toList(growable: false);
 
-Map<String, Object?> _sessionReady() => <String, Object?>{
-  'type': 'session_ready',
-  'protocol_version': 1,
-  'session_id': 'session-1',
-  'companion': 'aanya',
-  'ai_disclosure': 'Aanya is a fictional adult AI companion.',
-  'readiness': _readiness(),
-  'can_process_turns': true,
-  'audio_format': <String, Object?>{
-    'encoding': 'pcm_s16le',
-    'sample_rate_hz': 16000,
-    'channels': 1,
-  },
-};
+Map<String, Object?> _sessionReady({String sessionId = 'session-1'}) =>
+    <String, Object?>{
+      'type': 'session_ready',
+      'protocol_version': 1,
+      'session_id': sessionId,
+      'companion': 'aanya',
+      'ai_disclosure': 'Aanya is a fictional adult AI companion.',
+      'readiness': _readiness(),
+      'can_process_turns': true,
+      'audio_format': <String, Object?>{
+        'encoding': 'pcm_s16le',
+        'sample_rate_hz': 16000,
+        'channels': 1,
+      },
+    };
 
 Map<String, Object?> _readiness({
   String status = 'ready',
@@ -466,22 +703,35 @@ Map<String, Object?> _readiness({
       : 'Local model runtimes are warming.',
 };
 
-Map<String, Object?> _turnEvent(String type, {String? text, String? delta}) =>
+Map<String, Object?> _turnEvent(
+  String type, {
+  String turnId = 'turn-1',
+  String? text,
+  String? delta,
+}) => <String, Object?>{
+  'type': type,
+  'protocol_version': 1,
+  'turn_id': turnId,
+  'text': ?text,
+  'delta': ?delta,
+};
+
+Map<String, Object?> _audioHeader({String turnId = 'turn-1'}) =>
     <String, Object?>{
-      'type': type,
-      'protocol_version': 1,
-      'turn_id': 'turn-1',
-      'text': ?text,
-      'delta': ?delta,
+      ..._turnEvent('audio_chunk', turnId: turnId),
+      'sequence': 0,
+      'encoding': 'pcm_s16le',
+      'sample_rate_hz': 16000,
+      'channels': 1,
+      'byte_length': 4,
     };
 
-Map<String, Object?> _audioHeader() => <String, Object?>{
-  ..._turnEvent('audio_chunk'),
-  'sequence': 0,
-  'encoding': 'pcm_s16le',
-  'sample_rate_hz': 16000,
-  'channels': 1,
-  'byte_length': 4,
+Map<String, Object?> _cancelled({String? turnId}) => <String, Object?>{
+  'type': 'recoverable_error',
+  'protocol_version': 1,
+  'turn_id': ?turnId,
+  'code': 'turn_cancelled',
+  'message': 'The active realtime turn was cancelled.',
 };
 
 final AiraApiConfig _config = AiraApiConfig.fromBaseUrl(
@@ -518,6 +768,12 @@ final class _FakeSocket implements RealtimeWebSocket {
 
   @override
   void sendBinary(Uint8List bytes) => sentBinary.add(List<int>.from(bytes));
+
+  @override
+  Future<void> sendBinaryComplete(Uint8List bytes) async => sendBinary(bytes);
+
+  @override
+  Future<void> sendTextComplete(String text) async => sendText(text);
 
   void sendServerJson(Map<String, Object?> json) {
     _serverMessages.add(jsonEncode(json));

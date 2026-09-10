@@ -234,6 +234,47 @@ class TranscriptionValidationTests(TranscriptionTestCase):
 
 
 class ReusableTranscriptionRuntimeTests(TranscriptionTestCase):
+    def test_realtime_pcm_keeps_string_api_and_exposes_safe_diagnostics(self) -> None:
+        def segments():
+            yield SimpleNamespace(
+                start=0.0,
+                end=0.2,
+                text="Hi Aanya",
+                no_speech_prob=0.125,
+            )
+
+        fake_model = SimpleNamespace(
+            transcribe=mock.Mock(
+                side_effect=[(segments(), self._info()), (segments(), self._info())]
+            )
+        )
+        fake_model_class = mock.Mock(return_value=fake_model)
+        pcm = b"\x00\x01" * 640
+
+        text = transcription_module.transcribe_pcm16_audio(
+            pcm,
+            sample_rate_hz=16000,
+            channels=1,
+            model_dir=self.model_dir,
+            whisper_model_class=fake_model_class,
+        )
+        diagnostics = transcription_module.transcribe_pcm16_audio(
+            pcm,
+            sample_rate_hz=16000,
+            channels=1,
+            model_dir=self.model_dir,
+            whisper_model_class=fake_model_class,
+            include_diagnostics=True,
+        )
+
+        self.assertEqual("Hi Aanya", text)
+        self.assertIsInstance(
+            diagnostics, transcription_module.Pcm16TranscriptionResult
+        )
+        self.assertEqual("Hi Aanya", diagnostics.text)
+        self.assertEqual(1, diagnostics.segment_count)
+        self.assertEqual(0.125, diagnostics.stt_no_speech_probability)
+
     def test_model_reuse_consumes_segments_and_writes_metadata(self) -> None:
         exhausted_first: list[bool] = []
         exhausted_second: list[bool] = []

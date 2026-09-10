@@ -42,7 +42,9 @@ void main() {
       await _pumpAsyncWork(tester);
 
       expect(find.textContaining('Connected'), findsOneWidget);
-      expect(find.text('Hold to talk'), findsWidgets);
+      expect(find.text('Ready to start'), findsOneWidget);
+      expect(find.byKey(const Key('aanya_start_call')), findsOneWidget);
+      expect(find.byKey(const Key('aanya_microphone_control')), findsNothing);
       expect(api.healthCheckCount, 1);
 
       await _disposeVoiceScreen(tester, harness.controller);
@@ -64,15 +66,15 @@ void main() {
         await _pumpAsyncWork(tester);
         expect(find.textContaining('Connected'), findsOneWidget);
 
-        final firstGesture = await tester.startGesture(
-          tester.getCenter(find.byKey(const Key('aanya_microphone_control'))),
-        );
+        await tester.tap(find.byKey(const Key('aanya_start_call')));
         await _pumpAsyncWork(tester);
 
         expect(find.textContaining('Listening'), findsOneWidget);
         expect(harness.recorder.startCount, 1);
+        expect(find.byKey(const Key('aanya_end_call_button')), findsOneWidget);
+        expect(find.byKey(const Key('aanya_microphone_control')), findsNothing);
 
-        await firstGesture.up();
+        unawaited(harness.controller.finishRecording());
         await _pumpAsyncWork(tester);
 
         expect(find.textContaining('Understanding'), findsOneWidget);
@@ -100,13 +102,12 @@ void main() {
         harness.playback.completeNext();
         await _pumpAsyncWork(tester);
         await tester.pump(const Duration(milliseconds: 300));
-        expect(find.text('Hold to talk'), findsWidgets);
+        expect(find.byKey(const Key('aanya_end_call_button')), findsOneWidget);
+        expect(find.byKey(const Key('aanya_microphone_control')), findsNothing);
 
-        final secondGesture = await tester.startGesture(
-          tester.getCenter(find.byKey(const Key('aanya_microphone_control'))),
-        );
+        expect(await harness.controller.beginRecording(), isTrue);
         await _pumpAsyncWork(tester);
-        await secondGesture.up();
+        unawaited(harness.controller.finishRecording());
         await _pumpAsyncWork(tester);
 
         secondResponse.complete(
@@ -164,11 +165,9 @@ void main() {
       await _pumpVoiceScreen(tester, harness.controller);
       await _pumpAsyncWork(tester);
 
-      final gesture = await tester.startGesture(
-        tester.getCenter(find.byKey(const Key('aanya_microphone_control'))),
-      );
+      await tester.tap(find.byKey(const Key('aanya_start_call')));
       await _pumpAsyncWork(tester);
-      await gesture.up();
+      await harness.controller.finishRecording();
       await _pumpAsyncWork(tester);
 
       expect(find.byKey(const Key('voice_error_message')), findsOneWidget);
@@ -185,7 +184,8 @@ void main() {
       await tester.pump();
 
       expect(find.byKey(const Key('voice_error_message')), findsNothing);
-      expect(find.text('Hold to talk'), findsWidgets);
+      expect(find.byKey(const Key('aanya_end_call_button')), findsOneWidget);
+      expect(find.byKey(const Key('aanya_microphone_control')), findsNothing);
 
       await _disposeVoiceScreen(tester, harness.controller);
     });

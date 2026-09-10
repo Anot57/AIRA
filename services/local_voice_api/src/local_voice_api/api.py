@@ -665,6 +665,7 @@ def _default_warmup_coordinator(
     registry: ReadinessRegistry,
     *,
     tts_warmup: Callable[[], None] | None = None,
+    llm_warmup: Callable[[], None] | None = None,
 ) -> WarmupCoordinator:
     runtime_root = Path(DEFAULT_RUNTIME_ROOT)
     return WarmupCoordinator(
@@ -678,7 +679,7 @@ def _default_warmup_coordinator(
             ),
             WarmupStep(
                 "llm",
-                lambda: validate_local_llm_runtime(runtime_root),
+                llm_warmup or (lambda: validate_local_llm_runtime(runtime_root)),
             ),
             WarmupStep(
                 "tts",
@@ -705,6 +706,7 @@ def create_app(
     realtime_processor_factory: Callable[[], RealtimeTurnProcessor] | None = None,
     realtime_inference_available: bool = False,
     realtime_readiness_probe: Callable[[], None] | None = None,
+    realtime_capacity_snapshot: Callable[[], Mapping[str, object]] | None = None,
 ) -> FastAPI:
     """Create the local-only FastAPI app with injectable lightweight seams."""
 
@@ -790,6 +792,7 @@ def create_app(
     application.state.realtime_processor_factory = selected_processor_factory
     application.state.realtime_inference_available = realtime_inference_available
     application.state.realtime_readiness_probe = realtime_readiness_probe
+    application.state.realtime_capacity_snapshot = realtime_capacity_snapshot
 
     @application.exception_handler(ApiRequestError)
     async def api_error_handler(
@@ -813,6 +816,13 @@ def create_app(
                 await asyncio.to_thread(realtime_readiness_probe)
             except Exception:
                 snapshot = _degraded_realtime_snapshot(snapshot)
+        if realtime_capacity_snapshot is not None:
+            try:
+                snapshot["queues"] = dict(
+                    await asyncio.to_thread(realtime_capacity_snapshot)
+                )
+            except Exception:
+                _LOGGER.warning("Realtime queue diagnostics are unavailable.")
         return JSONResponse(
             status_code=200 if snapshot.get("status") == "ready" else 503,
             content=snapshot,
@@ -827,6 +837,7 @@ def create_app(
             processor_factory=selected_processor_factory,
             inference_available=realtime_inference_available,
             readiness_probe=realtime_readiness_probe,
+            capacity_snapshot=realtime_capacity_snapshot,
         )
         await handler.run()
 
@@ -926,18 +937,36 @@ def _create_default_application(
     coordinator = (
         _default_warmup_coordinator(
             registry,
-            tts_warmup=pocket_readiness,
+            tts_warmup=getattr(pocket_readiness, "__dict__", {}).get(
+                "tts_warmup", pocket_readiness
+            ),
+            llm_warmup=getattr(pocket_readiness, "__dict__", {}).get(
+                "llm_warmup"
+            ),
         )
         if warmup_enabled
         else None
     )
+    processor_factory = build_pocket_realtime_processor_factory(source)
+
+    def capacity_snapshot() -> dict[str, object]:
+        snapshot: dict[str, object] = {}
+        processor_capacity = getattr(processor_factory, "capacity_snapshot", None)
+        pocket_capacity = getattr(pocket_readiness, "capacity_snapshot", None)
+        if callable(processor_capacity):
+            snapshot.update(processor_capacity())
+        if callable(pocket_capacity):
+            snapshot.update(pocket_capacity())
+        return snapshot
+
     return create_app(
         readiness_registry=registry,
         warmup_coordinator=coordinator,
         warmup_on_start=warmup_enabled,
-        realtime_processor_factory=build_pocket_realtime_processor_factory(source),
+        realtime_processor_factory=processor_factory,
         realtime_inference_available=True,
         realtime_readiness_probe=pocket_readiness,
+        realtime_capacity_snapshot=capacity_snapshot,
     )
 
 

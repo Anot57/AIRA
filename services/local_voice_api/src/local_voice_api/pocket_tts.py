@@ -121,7 +121,7 @@ class PocketTtsWorkerSynthesizer:
         self._closed = False
 
     def check_ready(self) -> None:
-        payload = self._json_request("GET", "/ready")
+        payload = self.worker_snapshot()
         if payload.get("status") != "ready":
             reason = payload.get("message")
             detail = reason if isinstance(reason, str) and reason else "not ready"
@@ -136,6 +136,59 @@ class PocketTtsWorkerSynthesizer:
             raise RealtimeInferenceUnavailableError(
                 "Pocket TTS worker reported an unsupported audio format."
             )
+
+    def worker_snapshot(self) -> dict[str, object]:
+        """Return the worker's bounded, content-free readiness diagnostics."""
+
+        return self._json_request("GET", "/ready")
+
+    def warmup_inference(self) -> None:
+        """Synthesize and discard one bounded non-user phrase."""
+
+        turn_id = f"warmup_{uuid.uuid4().hex}"
+        request_id = uuid.uuid4().hex
+        body = json.dumps(
+            {"turn_id": turn_id, "request_id": request_id, "text": "Ready."},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        connection = self._connection(self.config.read_timeout_seconds)
+        response: http.client.HTTPResponse | None = None
+        received_bytes = 0
+        try:
+            connection.request(
+                "POST",
+                "/v1/synthesize",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    "Connection": "close",
+                },
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                detail = response.read(_MAX_ERROR_BODY_BYTES + 1)
+                raise RealtimeInferenceUnavailableError(
+                    self._response_error(response.status, detail)
+                )
+            self._validate_stream_headers(response)
+            while True:
+                pcm = self._read_frame(response)
+                if not pcm:
+                    break
+                received_bytes += len(pcm)
+                if received_bytes > 2 * 1024 * 1024:
+                    raise RealtimeInferenceUnavailableError(
+                        "Pocket TTS synthetic warmup exceeded its bound."
+                    )
+            if received_bytes == 0:
+                raise RealtimeInferenceUnavailableError(
+                    "Pocket TTS synthetic warmup returned no audio."
+                )
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
 
     async def warmup(self) -> None:
         await asyncio.to_thread(self.check_ready)
@@ -168,7 +221,12 @@ class PocketTtsWorkerSynthesizer:
                 raise asyncio.CancelledError
             request_id = uuid.uuid4().hex
             body = json.dumps(
-                {"turn_id": turn_id, "request_id": request_id, "text": request_text},
+                {
+                    "turn_id": turn_id,
+                    "request_id": request_id,
+                    "generation": generation,
+                    "text": request_text,
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")

@@ -186,6 +186,55 @@ class RealtimeLatencyMetrics:
     def snapshot(self) -> dict[str, float]:
         return dict(self._milestones)
 
+    def log_event(
+        self,
+        logger: logging.Logger,
+        event: str,
+        *,
+        session_id: str,
+        generation: int,
+        monotonic_us: int | None = None,
+        **fields: object,
+    ) -> None:
+        """Log one content-free, monotonic realtime boundary.
+
+        The event shares the exact monotonic clock used by the aggregate TTFA
+        metrics. Callers may add bounded operational counts or durations, but
+        never transcript or response text.
+        """
+
+        if not isinstance(event, str) or not event.strip():
+            raise ValueError("Realtime timing event names must be non-empty strings.")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise ValueError("generation must be an integer")
+        if generation < 1:
+            raise ValueError("generation must be positive")
+        if monotonic_us is not None and (
+            isinstance(monotonic_us, bool)
+            or not isinstance(monotonic_us, int)
+            or monotonic_us < 0
+        ):
+            raise ValueError("monotonic_us must be a non-negative integer")
+        suffix = "".join(
+            f" {key}={_safe_field(value)}" for key, value in sorted(fields.items())
+        )
+        logger.info(
+            "[AIRA REALTIME TIMING] event=%s session_id=%s turn_id=%s "
+            "generation=%d monotonic_us=%d%s",
+            _safe_field(event),
+            _safe_field(session_id),
+            _safe_field(self.turn_id),
+            generation,
+            (
+                round(self._clock() * 1_000_000)
+                if monotonic_us is None
+                else monotonic_us
+            ),
+            suffix,
+        )
+
     def log(self, logger: logging.Logger = _LOGGER) -> None:
         fields = " ".join(
             f"{key}={value:.3f}" for key, value in sorted(self._milestones.items())

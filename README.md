@@ -37,18 +37,19 @@ transport remain future work.
 ## Current state
 
 - The Android-only Flutter application in `apps/mobile` includes onboarding,
-  scheduling, settings, 20 companions, and an Aanya-only local push-to-talk
-  prototype. The other 19 voice-call screens remain deterministic mocks.
+  scheduling, settings, 20 companions, and an Aanya-only continuous local AI
+  voice-call prototype. The other 19 voice-call screens remain deterministic
+  mocks.
 - Offline developer tooling in `services/local_voice_api` can run one complete
   local Aanya audio turn without changing or connecting the Android UI.
 - A local-development FastAPI bridge exposes that turn to the Android client;
   it is unauthenticated, trusted-LAN-only, and must never be exposed publicly.
   There is no deployed or production backend.
 - A versioned `/v1/realtime` WebSocket, readiness/warmup infrastructure,
-  streaming adapter contracts, server timing, and a bounded Flutter realtime
-  client now form a mock-tested foundation. Production inference adapters,
-  streaming microphone/playback wiring, and device TTFA measurements are not
-  complete; the current Aanya screen intentionally still uses the HTTP path.
+  streaming adapter contracts, server timing, bounded Flutter realtime client,
+  PCM microphone capture, and native Android streaming playback now form the
+  Aanya call path. Physical-device behavior and phone-observed TTFA still need
+  measurement; the original HTTP implementation remains a fallback/debug path.
 - Aanya's debug flow records a temporary microphone WAV and plays the generated
   local response. UI session history remains in memory; there is no persistent
   conversational memory, authentication, payment, or paid API integration.

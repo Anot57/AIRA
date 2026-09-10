@@ -5,15 +5,54 @@ identified AI voice companion. `Aira` is a temporary product name centralized
 in `lib/core/constants/app_copy.dart`.
 
 The current local prototype connects only Aanya to the trusted-development Aira
-HTTP service for push-to-talk voice turns. The other 19 companions retain their
-deterministic mock-call experience. Visible Aanya turns are screen-session state
-only; the backend does not yet provide persistent conversational memory.
+realtime WebSocket for a continuous Start Call / End Call conversation. The
+original whole-WAV HTTP
+controller remains available as a fallback/debug path. The other 19 companions
+retain their deterministic mock-call experience. Visible Aanya turns are
+screen-session state only; there is no persistent conversational memory.
 
-The app also contains a bounded, version-1 realtime WebSocket client and typed
-state/protocol handling. It is covered with fake-socket tests but is not yet
-wired to the production call screen, microphone PCM streaming, or continuous
-PCM playback. The existing HTTP Aanya experience remains the active UI until a
-realtime inference stack is fast enough and device measurements are available.
+The production Aanya screen uses one bounded, version-1 WebSocket per call
+session. Android microphone input uses a native `AudioRecord` read loop at
+16 kHz mono PCM16, preferring `VOICE_RECOGNITION` and falling back to `MIC`.
+The `record` package remains only for the existing permission flow and the HTTP
+whole-WAV fallback; production realtime capture does **not** call
+`record.startStream`. Native frames are defensively rechunked to 1,280 bytes
+(40 ms).
+Response PCM is forwarded in sequence to a native Android `AudioTrack` in
+streaming mode at the server-announced rate; playback begins with the first
+validated chunk rather than waiting for `turn_complete`.
+
+After Start Call, listening begins automatically. An energy endpoint detector
+requires three consecutive onset frames, uses adaptive-noise hysteresis, and
+finalizes exactly once after 3,000 ms of post-speech silence. It never creates
+empty turns before confirmed speech. A bounded 400 ms pre-speech ring preserves
+soft first syllables; only 200 ms of trailing padding is forwarded, so the
+intentional endpoint wait does not add roughly three seconds of known silence
+to batch STT. The threshold can be overridden at build time with
+`AIRA_USER_SILENCE_ENDPOINT_MS`.
+
+The realtime socket, session handshake, and safe audio-format preparation are
+warmed when the screen opens. A 950 ms client watchdog and 900 ms native
+watchdog turn a zero-byte capture into a recoverable error. Endpoint teardown
+waits for the native read loop's final frame, Dart framing, and ordered
+WebSocket writes before `end_of_turn`.
+
+An Android microphone foreground service owns active-call intent and native
+audio resources. Home, shade, lock/screen-off, volume-key UI, app switching,
+and transient audio focus changes do not intentionally close the call or
+socket. Network loss enters reconnecting and preserves active-call intent.
+Android may still suspend or revoke audio for a phone call, alarm, exclusive
+microphone owner, process kill, or force-stop; those conditions cannot be
+prevented by an app.
+
+Internal cancellation stops native capture and playback before waiting for the server. The
+client accepts only the matching `turn_cancelled` acknowledgement, suppresses
+stale text/audio while cancellation is pending, and recreates the WebSocket
+session after a bounded 400 ms acknowledgement timeout. Leaving the call also
+invalidates queued callbacks and stops the engine-owned native bridges; opening
+it again creates a new controller, client, socket, and protocol state. Native
+channel owners remain alive until Flutter engine cleanup, so disposing one
+screen cannot permanently poison the next screen instance.
 
 The development API is unauthenticated and uses plain HTTP. Use it only on a
 trusted LAN, never port-forward it to the public internet, and do not use it on
@@ -43,7 +82,8 @@ flutter test
 flutter build apk --debug --dart-define=AIRA_API_BASE_URL=http://192.168.1.100:8765
 ```
 
-Opening Aanya performs one short-timeout health check. A voice turn records a
-unique 16 kHz mono WAV in the app cache, posts it once as multipart form data,
-deletes the microphone WAV, displays the normalized transcript and response,
-then plays the returned same-origin WAV without permanently saving it.
+Opening Aanya creates and prewarms a persistent realtime session. Start Call
+keeps the microphone disabled until Android permission, foreground-service
+startup, and `session_ready` with `can_process_turns=true`. The HTTP
+fallback still records a temporary 16 kHz mono WAV, posts it once, and plays the
+returned same-origin WAV without permanently saving it.

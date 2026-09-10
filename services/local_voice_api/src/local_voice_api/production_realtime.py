@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import os
 
 from .conversation import (
     AANYA_SYSTEM_PERSONA,
@@ -24,17 +25,21 @@ from .realtime_protocol import PcmAudioFormat
 from .streaming import (
     BoundedBatchStreamingTranscriber,
     CompleteResponseStreamingLlmAdapter,
+    FinalTranscriptionResult,
     NoSpeechDetectedError,
+    SttAdmissionController,
 )
 from .transcription import (
     DEFAULT_CPU_THREADS,
     NoSpeechError,
+    Pcm16TranscriptionResult,
     transcribe_pcm16_audio,
 )
 
 
 
 REALTIME_LLM_PROVIDER_ENVIRONMENT = "AIRA_REALTIME_LLM_PROVIDER"
+REALTIME_STT_CONCURRENCY_ENVIRONMENT = "AIRA_REALTIME_STT_CONCURRENCY"
 
 
 def _realtime_llm_provider(
@@ -62,6 +67,13 @@ def build_pocket_realtime_processor_factory(
     """Return a cheap per-session factory; the persistent worker owns the model."""
 
     worker_config = PocketTtsWorkerConfig.from_environment(environ)
+    source = os.environ if environ is None else environ
+    raw_stt_concurrency = source.get(REALTIME_STT_CONCURRENCY_ENVIRONMENT, "1")
+    try:
+        stt_concurrency = int(raw_stt_concurrency)
+    except ValueError as error:
+        raise ValueError("AIRA_REALTIME_STT_CONCURRENCY must be an integer.") from error
+    stt_admission = SttAdmissionController(stt_concurrency)
     llm_provider = _realtime_llm_provider(environ)
     llama_server_config = (
         LlamaServerConfig.from_environment(environ)
@@ -82,11 +94,17 @@ def build_pocket_realtime_processor_factory(
             )
 
         return StreamingRealtimeTurnProcessor(
-            BoundedBatchStreamingTranscriber(_transcribe_pcm),
+            BoundedBatchStreamingTranscriber(
+                _transcribe_pcm,
+                admission=stt_admission,
+            ),
             language_model,
             PocketTtsWorkerSynthesizer(worker_config),
         )
 
+    create_processor.capacity_snapshot = lambda: {  # type: ignore[attr-defined]
+        "stt": stt_admission.snapshot()
+    }
     return create_processor
 
 
@@ -105,22 +123,55 @@ def build_pocket_tts_readiness_check(
         else None
     )
 
+    pocket = PocketTtsWorkerSynthesizer(config)
+
     def check() -> None:
-        PocketTtsWorkerSynthesizer(config).check_ready()
+        pocket.check_ready()
         if llama_server is not None:
             llama_server.check_ready()
 
+    def warmup_tts() -> None:
+        pocket.check_ready()
+        pocket.warmup_inference()
+
+    check.tts_warmup = warmup_tts  # type: ignore[attr-defined]
+    if llama_server is not None:
+        check.llm_warmup = llama_server.warmup_inference  # type: ignore[attr-defined]
+
+    check.capacity_snapshot = lambda: {  # type: ignore[attr-defined]
+        "pocket_tts": {
+            key: value
+            for key, value in pocket.worker_snapshot().items()
+            if key
+            in {
+                "busy",
+                "queue_depth",
+                "queue_capacity",
+                "oldest_queue_wait_ms",
+            }
+        }
+    }
     return check
 
 
-def _transcribe_pcm(audio: bytes, audio_format: PcmAudioFormat) -> str:
+def _transcribe_pcm(
+    audio: bytes, audio_format: PcmAudioFormat
+) -> FinalTranscriptionResult:
     try:
-        return transcribe_pcm16_audio(
+        result = transcribe_pcm16_audio(
             audio,
             sample_rate_hz=audio_format.sample_rate_hz,
             channels=audio_format.channels,
             model_dir=DEFAULT_RUNTIME_ROOT / "models" / "faster-whisper",
             cpu_threads=DEFAULT_CPU_THREADS,
+            include_diagnostics=True,
+        )
+        if not isinstance(result, Pcm16TranscriptionResult):
+            raise RuntimeError("Realtime STT diagnostics were unavailable.")
+        return FinalTranscriptionResult(
+            text=result.text,
+            segment_count=result.segment_count,
+            stt_no_speech_probability=result.stt_no_speech_probability,
         )
     except NoSpeechError as error:
         raise NoSpeechDetectedError(str(error)) from error

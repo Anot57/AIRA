@@ -80,6 +80,15 @@ class TranscriptionResult:
     segments: tuple[TranscriptSegment, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class Pcm16TranscriptionResult:
+    """Realtime PCM transcript plus content-free recognition diagnostics."""
+
+    text: str
+    segment_count: int
+    stt_no_speech_probability: float | None
+
+
 _runtime_lock = threading.RLock()
 _whisper_model: Any = None
 _loaded_runtime_config: TranscriptionRuntimeConfiguration | None = None
@@ -390,7 +399,8 @@ def transcribe_pcm16_audio(
     model_dir: os.PathLike[str] | str = DEFAULT_MODEL_DIR,
     cpu_threads: int = DEFAULT_CPU_THREADS,
     whisper_model_class: Any | None = None,
-) -> str:
+    include_diagnostics: bool = False,
+) -> str | Pcm16TranscriptionResult:
     """Transcribe in-memory little-endian PCM16 for the realtime voice path."""
 
     if not isinstance(audio, bytes):
@@ -473,7 +483,26 @@ def transcribe_pcm16_audio(
                     "the realtime audio may be empty or silent."
                 )
 
-            return transcript
+            no_speech_probabilities: list[float] = []
+            for raw_segment in raw_segments:
+                raw_probability = getattr(raw_segment, "no_speech_prob", None)
+                if isinstance(raw_probability, (int, float)) and not isinstance(
+                    raw_probability, bool
+                ):
+                    probability = float(raw_probability)
+                    if math.isfinite(probability) and 0.0 <= probability <= 1.0:
+                        no_speech_probabilities.append(probability)
+            diagnostics = Pcm16TranscriptionResult(
+                text=transcript,
+                segment_count=len(segments),
+                # Preserve the most conservative segment-level probability.
+                stt_no_speech_probability=(
+                    round(max(no_speech_probabilities), 6)
+                    if no_speech_probabilities
+                    else None
+                ),
+            )
+            return diagnostics if include_diagnostics else transcript
 
         except NoSpeechError:
             raise
@@ -640,7 +669,7 @@ def warmup_transcription_runtime(
     *,
     whisper_model_class: Any | None = None,
 ) -> None:
-    """Load the configured CPU model once without transcribing any audio."""
+    """Load the model and run one bounded synthetic, non-user inference."""
 
     threads = validate_cpu_threads(cpu_threads)
     resolved_model_dir = validate_storage_directory(model_dir, "Model directory")
@@ -656,7 +685,23 @@ def warmup_transcription_runtime(
         model_dir=resolved_model_dir,
     )
     with _runtime_lock:
-        _ensure_whisper_model(configuration, whisper_model_class)
+        model = _ensure_whisper_model(configuration, whisper_model_class)
+        try:
+            import numpy as np
+
+            synthetic = np.zeros(16_000, dtype=np.float32)
+            segments, _ = model.transcribe(
+                synthetic,
+                language=LANGUAGE,
+                beam_size=BEAM_SIZE,
+                vad_filter=VAD_FILTER,
+                condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+            )
+            list(segments)
+        except Exception as error:
+            raise TranscriptionError(
+                "Synthetic Faster-Whisper warmup inference failed."
+            ) from error
 
 
 def shutdown_transcription_runtime() -> None:

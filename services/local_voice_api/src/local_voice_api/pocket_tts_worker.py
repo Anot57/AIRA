@@ -12,7 +12,10 @@ import os
 import re
 import struct
 import threading
+import time
+from collections import deque
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +37,7 @@ DEFAULT_CACHE_ROOT = DEFAULT_RUNTIME_ROOT / "cache"
 VOICE_STATE_ENVIRONMENT = "AIRA_POCKET_TTS_VOICE_STATE"
 CACHE_ROOT_ENVIRONMENT = "AIRA_POCKET_TTS_CACHE_ROOT"
 OFFLINE_ENVIRONMENT = "AIRA_POCKET_TTS_OFFLINE"
+MAX_QUEUE_ENVIRONMENT = "AIRA_POCKET_TTS_MAX_QUEUE"
 
 _TURN_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,119}\Z")
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -48,14 +52,33 @@ class WorkerRequestError(RuntimeError):
         self.message = message
 
 
+@dataclass(slots=True)
+class _QueuedSynthesis:
+    turn_id: str
+    request_id: str
+    generation: int
+    enqueued_at: float
+    cancelled: bool = False
+
+
 class PocketTtsRuntime:
     """Own exactly one model and one cached Aanya state for the process."""
 
-    def __init__(self, voice_state_path: Path, cache_root: Path) -> None:
+    def __init__(
+        self,
+        voice_state_path: Path,
+        cache_root: Path,
+        *,
+        max_queued_requests: int = 8,
+    ) -> None:
+        if max_queued_requests <= 0 or max_queued_requests > 64:
+            raise ValueError("Pocket TTS queue limit must be between 1 and 64.")
         self.voice_state_path = voice_state_path
         self.cache_root = cache_root
         self._state_lock = threading.RLock()
-        self._generation_lock = threading.Lock()
+        self._queue_condition = threading.Condition(self._state_lock)
+        self._queue: deque[_QueuedSynthesis] = deque()
+        self._max_queued_requests = max_queued_requests
         self._status = "starting"
         self._message = "Pocket TTS initialization has not started."
         self._model: Any | None = None
@@ -121,11 +144,22 @@ class PocketTtsRuntime:
                 "sample_rate_hz": SAMPLE_RATE_HZ,
                 "channels": CHANNELS,
                 "encoding": ENCODING,
-                "busy": self._generation_lock.locked(),
+                "busy": self._active_request_id is not None,
+                "queue_depth": len(self._queue),
+                "queue_capacity": self._max_queued_requests,
+                "oldest_queue_wait_ms": (
+                    round((time.monotonic() - self._queue[0].enqueued_at) * 1000, 3)
+                    if self._queue
+                    else 0.0
+                ),
             }
 
     def stream_pcm(
-        self, turn_id: str, request_id: str, text: str
+        self,
+        turn_id: str,
+        request_id: str,
+        text: str,
+        generation: int = 1,
     ) -> Iterator[bytes]:
         with self._state_lock:
             if self._status != "ready" or self._model is None or self._voice_state is None:
@@ -134,21 +168,59 @@ class PocketTtsRuntime:
                     "model_not_ready",
                     "Pocket TTS model and Aanya voice state are not ready.",
                 )
-        if not self._generation_lock.acquire(blocking=False):
-            raise WorkerRequestError(
-                HTTPStatus.CONFLICT,
-                "worker_busy",
-                "Pocket TTS is already synthesizing another request.",
-            )
-
+        queued = _QueuedSynthesis(
+            turn_id,
+            request_id,
+            generation,
+            time.monotonic(),
+        )
         cancel_event = threading.Event()
-        with self._state_lock:
+        with self._queue_condition:
+            if len(self._queue) >= self._max_queued_requests:
+                raise WorkerRequestError(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    "worker_queue_full",
+                    "Pocket TTS synthesis queue is full.",
+                )
+            self._queue.append(queued)
+            _LOGGER.info(
+                "[AIRA POCKET TIMING] event=tts_queue_enter turn_id=%s "
+                "generation=%d request_id=%s monotonic_us=%d queue_depth=%d",
+                turn_id,
+                generation,
+                request_id,
+                time.monotonic_ns() // 1_000,
+                len(self._queue),
+            )
+            self._queue_condition.notify_all()
+            while self._queue[0] is not queued or self._active_request_id is not None:
+                self._queue_condition.wait(timeout=0.1)
+                if queued.cancelled:
+                    if queued in self._queue:
+                        self._queue.remove(queued)
+                    self._queue_condition.notify_all()
+                    raise WorkerRequestError(
+                        HTTPStatus.CONFLICT,
+                        "request_cancelled",
+                        "Pocket TTS synthesis was cancelled while queued.",
+                    )
+            self._queue.popleft()
             self._active_turn_id = turn_id
             self._active_request_id = request_id
             self._cancel_event = cancel_event
             model = self._model
             voice_state = self._voice_state
+            _LOGGER.info(
+                "[AIRA POCKET TIMING] event=tts_start turn_id=%s generation=%d "
+                "request_id=%s monotonic_us=%d queue_wait_ms=%.3f",
+                turn_id,
+                generation,
+                request_id,
+                time.monotonic_ns() // 1_000,
+                max(0.0, time.monotonic() - queued.enqueued_at) * 1000.0,
+            )
         stream = None
+        first_pcm = True
         try:
             stream = model.generate_audio_stream(voice_state, text, copy_state=True)
             for tensor in stream:
@@ -160,6 +232,18 @@ class PocketTtsRuntime:
                         break
                     frame = pcm[offset : offset + MAX_PCM_FRAME_BYTES]
                     if frame:
+                        if first_pcm:
+                            first_pcm = False
+                            _LOGGER.info(
+                                "[AIRA POCKET TIMING] event=tts_first_pcm "
+                                "turn_id=%s generation=%d request_id=%s "
+                                "monotonic_us=%d byte_length=%d",
+                                turn_id,
+                                generation,
+                                request_id,
+                                time.monotonic_ns() // 1_000,
+                                len(frame),
+                            )
                         yield frame
                 if cancel_event.is_set():
                     break
@@ -168,19 +252,27 @@ class PocketTtsRuntime:
                 close = getattr(stream, "close", None)
                 if callable(close):
                     close()
-            with self._state_lock:
+            with self._queue_condition:
                 if self._active_request_id == request_id:
                     self._active_turn_id = None
                     self._active_request_id = None
                     self._cancel_event = None
-            self._generation_lock.release()
+                self._queue_condition.notify_all()
 
     def cancel(self, turn_id: str) -> bool:
-        with self._state_lock:
-            if self._active_turn_id != turn_id or self._cancel_event is None:
-                return False
-            self._cancel_event.set()
-            return True
+        with self._queue_condition:
+            if self._active_turn_id == turn_id and self._cancel_event is not None:
+                self._cancel_event.set()
+                return True
+            cancelled = False
+            for queued in tuple(self._queue):
+                if queued.turn_id == turn_id:
+                    queued.cancelled = True
+                    self._queue.remove(queued)
+                    cancelled = True
+            if cancelled:
+                self._queue_condition.notify_all()
+            return cancelled
 
 
 class PocketTtsWorkerServer(ThreadingHTTPServer):
@@ -238,6 +330,13 @@ class PocketTtsRequestHandler(BaseHTTPRequestHandler):
     def _synthesize(self, payload: dict[str, object]) -> None:
         turn_id = _required_identifier(payload, "turn_id", _TURN_ID)
         request_id = _required_identifier(payload, "request_id", _REQUEST_ID)
+        generation = payload.get("generation", 1)
+        if type(generation) is not int or generation <= 0:
+            raise WorkerRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_generation",
+                "Synthesis generation must be a positive integer.",
+            )
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             raise WorkerRequestError(
@@ -253,7 +352,12 @@ class PocketTtsRequestHandler(BaseHTTPRequestHandler):
                 "Synthesis text exceeds the worker limit.",
             )
 
-        stream = self.server.runtime.stream_pcm(turn_id, request_id, normalized)
+        stream = self.server.runtime.stream_pcm(
+            turn_id,
+            request_id,
+            normalized,
+            generation,
+        )
         try:
             first_frame = next(stream)
         except StopIteration:
@@ -417,6 +521,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(os.environ.get(VOICE_STATE_ENVIRONMENT, DEFAULT_VOICE_STATE)),
     )
     parser.add_argument(
+        "--max-queued-requests",
+        type=int,
+        default=int(os.environ.get(MAX_QUEUE_ENVIRONMENT, "8")),
+    )
+    parser.add_argument(
         "--cache-root",
         type=Path,
         default=Path(os.environ.get(CACHE_ROOT_ENVIRONMENT, DEFAULT_CACHE_ROOT)),
@@ -433,7 +542,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    runtime = PocketTtsRuntime(args.voice_state, args.cache_root)
+    runtime = PocketTtsRuntime(
+        args.voice_state,
+        args.cache_root,
+        max_queued_requests=args.max_queued_requests,
+    )
     server = PocketTtsWorkerServer((host, args.port), runtime)
     loader = threading.Thread(
         target=runtime.initialize,

@@ -10,6 +10,15 @@ import 'voice_io.dart';
 
 enum VoiceCallPhase {
   idle,
+  connecting,
+  ready,
+  listening,
+  finalizingUserTurn,
+  thinking,
+  speaking,
+  reconnecting,
+  ending,
+  ended,
   checkingConnection,
   recording,
   processing,
@@ -28,6 +37,9 @@ final class VoiceCallState {
     required this.statusLabel,
     required List<ConversationSessionTurn> turns,
     this.userMessage,
+    this.callActive = false,
+    this.callStartedAt,
+    this.callGeneration = 0,
   }) : turns = List<ConversationSessionTurn>.unmodifiable(turns);
 
   factory VoiceCallState.initial() => VoiceCallState(
@@ -42,6 +54,17 @@ final class VoiceCallState {
   final String statusLabel;
   final List<ConversationSessionTurn> turns;
   final String? userMessage;
+  final bool callActive;
+  final DateTime? callStartedAt;
+  final int callGeneration;
+
+  bool get canStartCall =>
+      !callActive &&
+      phase != VoiceCallPhase.connecting &&
+      phase != VoiceCallPhase.ending &&
+      phase != VoiceCallPhase.disposed;
+
+  bool get canEndCall => callActive && phase != VoiceCallPhase.ending;
 
   bool get canStartRecording =>
       connection == LocalAiConnection.connected &&
@@ -51,6 +74,9 @@ final class VoiceCallState {
       connection == LocalAiConnection.offline &&
       (phase == VoiceCallPhase.idle || phase == VoiceCallPhase.error);
 
+  bool get canCancelTurn =>
+      phase == VoiceCallPhase.processing || phase == VoiceCallPhase.playing;
+
   VoiceCallState copyWith({
     VoiceCallPhase? phase,
     LocalAiConnection? connection,
@@ -58,6 +84,10 @@ final class VoiceCallState {
     List<ConversationSessionTurn>? turns,
     String? userMessage,
     bool clearUserMessage = false,
+    bool? callActive,
+    DateTime? callStartedAt,
+    int? callGeneration,
+    bool clearCallStartedAt = false,
   }) {
     return VoiceCallState(
       phase: phase ?? this.phase,
@@ -65,12 +95,35 @@ final class VoiceCallState {
       statusLabel: statusLabel ?? this.statusLabel,
       turns: turns ?? this.turns,
       userMessage: clearUserMessage ? null : (userMessage ?? this.userMessage),
+      callActive: callActive ?? this.callActive,
+      callStartedAt: clearCallStartedAt
+          ? null
+          : (callStartedAt ?? this.callStartedAt),
+      callGeneration: callGeneration ?? this.callGeneration,
     );
   }
 }
 
+abstract interface class AanyaVoiceCallCoordinator implements Listenable {
+  VoiceCallState get state;
+  Future<void> get shutdownComplete;
+  Future<void> initialize();
+  Future<bool> startCall();
+  Future<void> endCall();
+  Future<void> retryConnection();
+  Future<bool> beginRecording();
+  Future<void> finishRecording();
+  Future<void> cancelRecording();
+  Future<void> cancelActiveTurn();
+  Future<void> handleAppBackgrounded();
+  void handleAppResumed();
+  void clearRecoverableError();
+  void dispose();
+}
+
 /// Coordinates one whole-WAV -> HTTP -> generated-WAV local voice turn.
-final class AanyaVoiceCallController extends ChangeNotifier {
+final class AanyaVoiceCallController extends ChangeNotifier
+    implements AanyaVoiceCallCoordinator {
   AanyaVoiceCallController({
     required String companionId,
     required this.api,
@@ -102,6 +155,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
   final Duration minimumRecordingDuration;
 
   VoiceCallState _state = VoiceCallState.initial();
+  @override
   VoiceCallState get state => _state;
 
   _RecordingAttempt? _recordingAttempt;
@@ -111,20 +165,60 @@ final class AanyaVoiceCallController extends ChangeNotifier {
   var _isForeground = true;
   Future<void> _shutdownComplete = Future<void>.value();
 
+  @override
   Future<void> get shutdownComplete => _shutdownComplete;
 
   static bool supportsCompanion(String companionId) =>
       companionId == supportedCompanionId;
 
+  @override
   Future<void> initialize() async {
     if (_initialized || _disposed) return;
     _initialized = true;
     await _checkConnection();
   }
 
+  @override
   Future<void> retryConnection() async {
     if (_disposed || !_state.canRetryConnection) return;
     await _checkConnection();
+  }
+
+  @override
+  Future<bool> startCall() async {
+    if (_disposed || _state.callActive) return false;
+    _emit(
+      _state.copyWith(
+        callActive: true,
+        callStartedAt: _now(),
+        callGeneration: _operationGeneration + 1,
+        clearUserMessage: true,
+      ),
+    );
+    final started = await beginRecording();
+    if (!started && !_disposed) {
+      _emit(
+        _state.copyWith(callActive: false, clearCallStartedAt: true),
+      );
+    }
+    return started;
+  }
+
+  @override
+  Future<void> endCall() async {
+    if (_disposed || !_state.callActive) return;
+    await cancelActiveTurn();
+    if (!_disposed) {
+      _emit(
+        _state.copyWith(
+          phase: VoiceCallPhase.ended,
+          statusLabel: 'Call ended',
+          callActive: false,
+          clearCallStartedAt: true,
+          clearUserMessage: true,
+        ),
+      );
+    }
   }
 
   Future<void> _checkConnection() async {
@@ -150,7 +244,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
         _state.copyWith(
           phase: VoiceCallPhase.idle,
           connection: LocalAiConnection.connected,
-          statusLabel: 'Hold to talk',
+          statusLabel: 'Ready to start',
           clearUserMessage: true,
         ),
       );
@@ -163,6 +257,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     }
   }
 
+  @override
   Future<bool> beginRecording() async {
     if (_disposed || !_state.canStartRecording) return false;
 
@@ -234,6 +329,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     }
   }
 
+  @override
   Future<void> finishRecording() async {
     final attempt = _recordingAttempt;
     if (_disposed ||
@@ -305,8 +401,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
       await _deleteAttemptPath(attempt);
       _recordingAttempt = null;
       _fail(
-        'That was a little too short. Hold the microphone while you speak, '
-        'then release it.',
+        'That recording was too short to process.',
         category: 'recording_too_short',
       );
       return;
@@ -389,8 +484,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     } on Object {
       if (_isOperationCurrent(attempt.token)) {
         _fail(
-          "Aanya's response is ready, but the audio couldn't play. You can "
-          'record another turn.',
+          "Aanya's response is ready, but the audio couldn't play.",
           category: 'playback_failed',
         );
       }
@@ -402,18 +496,22 @@ final class AanyaVoiceCallController extends ChangeNotifier {
       _emit(
         _state.copyWith(
           phase: VoiceCallPhase.idle,
-          statusLabel: 'Hold to talk',
+          statusLabel: 'Call active',
           clearUserMessage: true,
         ),
       );
     }
   }
 
+  @override
   Future<void> cancelRecording() async {
     final attempt = _recordingAttempt;
     if (_disposed || attempt == null) return;
     await _cancelAttempt(attempt, returnToIdle: true);
   }
+
+  @override
+  Future<void> cancelActiveTurn() => cancelRecording();
 
   Future<void> _cancelAttempt(
     _RecordingAttempt attempt, {
@@ -430,7 +528,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
           _emit(
             _state.copyWith(
               phase: VoiceCallPhase.idle,
-              statusLabel: 'Hold to talk',
+              statusLabel: 'Call active',
               clearUserMessage: true,
             ),
           );
@@ -439,6 +537,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     }();
   }
 
+  @override
   Future<void> handleAppBackgrounded() async {
     if (_disposed) return;
     _isForeground = false;
@@ -453,7 +552,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
         _emit(
           _state.copyWith(
             phase: VoiceCallPhase.idle,
-            statusLabel: 'Hold to talk',
+            statusLabel: 'Call active',
             clearUserMessage: true,
           ),
         );
@@ -461,10 +560,12 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     }
   }
 
+  @override
   void handleAppResumed() {
     if (!_disposed) _isForeground = true;
   }
 
+  @override
   void clearRecoverableError() {
     if (_disposed ||
         _state.phase != VoiceCallPhase.error ||
@@ -474,7 +575,7 @@ final class AanyaVoiceCallController extends ChangeNotifier {
     _emit(
       _state.copyWith(
         phase: VoiceCallPhase.idle,
-        statusLabel: 'Hold to talk',
+        statusLabel: _state.callActive ? 'Call active' : 'Ready to start',
         clearUserMessage: true,
       ),
     );

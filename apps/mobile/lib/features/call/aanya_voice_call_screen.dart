@@ -1,5 +1,4 @@
 import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -8,6 +7,11 @@ import '../../core/config/aira_api_config.dart';
 import '../../core/theme/app_tokens.dart';
 import '../companions/domain/companion.dart';
 import 'application/aanya_voice_call_controller.dart';
+import 'application/aanya_realtime_client.dart';
+import 'application/aanya_realtime_voice_call_controller.dart';
+import 'data/android_active_call_service.dart';
+import 'data/android_pcm_voice_playback.dart';
+import 'data/android_pcm_voice_recorder.dart';
 import 'data/http_conversation_api.dart';
 import 'data/just_audio_voice_playback.dart';
 import 'data/record_voice_recorder.dart';
@@ -19,7 +23,7 @@ typedef AanyaVoiceCallBuilder = Widget Function({
   required VoidCallback onEnd,
 });
 
-/// Real push-to-talk screen for Aanya's approved local voice only.
+/// Continuous Android voice-call screen for Aanya's approved local AI voice.
 class AanyaVoiceCallScreen extends StatefulWidget {
   const AanyaVoiceCallScreen({
     super.key,
@@ -45,6 +49,30 @@ class AanyaVoiceCallScreen extends StatefulWidget {
       key: key,
       companion: companion,
       onEnd: onEnd,
+      controller: AanyaRealtimeVoiceCallController(
+        companionId: companion.id,
+        client: AanyaRealtimeClient(companionId: companion.id, config: config),
+        recorder: AndroidPcmVoiceRecorder(),
+        playback: AndroidPcmVoicePlayback(),
+        activeCallPlatform: AndroidActiveCallService(),
+      ),
+    );
+  }
+
+  /// Explicit whole-WAV HTTP fallback for local diagnosis.
+  static AanyaVoiceCallScreen httpFallback({
+    Key? key,
+    required Companion companion,
+    required VoidCallback onEnd,
+    required AiraApiConfig config,
+  }) {
+    if (!AanyaVoiceCallController.supportsCompanion(companion.id)) {
+      throw ArgumentError.value(companion.id, 'companion');
+    }
+    return AanyaVoiceCallScreen(
+      key: key,
+      companion: companion,
+      onEnd: onEnd,
       controller: AanyaVoiceCallController(
         companionId: companion.id,
         api: HttpConversationApi(config: config, client: http.Client()),
@@ -57,7 +85,7 @@ class AanyaVoiceCallScreen extends StatefulWidget {
 
   final Companion companion;
   final VoidCallback onEnd;
-  final AanyaVoiceCallController controller;
+  final AanyaVoiceCallCoordinator controller;
 
   @override
   State<AanyaVoiceCallScreen> createState() => _AanyaVoiceCallScreenState();
@@ -66,10 +94,12 @@ class AanyaVoiceCallScreen extends StatefulWidget {
 class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
     with WidgetsBindingObserver {
   final _scrollController = ScrollController();
-  int? _activePointer;
   var _lastTurnCount = 0;
+  Timer? _durationTicker;
+  var _allowPop = false;
+  var _endingFromUi = false;
 
-  AanyaVoiceCallController get _controller => widget.controller;
+  AanyaVoiceCallCoordinator get _controller => widget.controller;
 
   @override
   void initState() {
@@ -96,6 +126,7 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
 
   void _handleControllerChanged() {
     if (!mounted) return;
+    _syncDurationTicker();
     final turnCount = _controller.state.turns.length;
     if (turnCount == _lastTurnCount) return;
     _lastTurnCount = turnCount;
@@ -111,6 +142,17 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
     });
   }
 
+  void _syncDurationTicker() {
+    if (_controller.state.callActive) {
+      _durationTicker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _durationTicker?.cancel();
+      _durationTicker = null;
+    }
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
@@ -118,55 +160,42 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
         _controller.handleAppResumed();
         return;
       case AppLifecycleState.inactive:
+        // Notification shade, volume UI, system dialogs, and focus changes are
+        // transient. They are never route/call disposal.
+        return;
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
-      case AppLifecycleState.detached:
-        _activePointer = null;
         unawaited(_controller.handleAppBackgrounded());
+        return;
+      case AppLifecycleState.detached:
+        // Native foreground-service ownership is independent from Activity
+        // attachment. Widget disposal handles a genuinely destroyed engine.
         return;
     }
   }
 
-  void _handlePointerDown(PointerDownEvent event) {
-    if (_activePointer != null || !_controller.state.canStartRecording) return;
-    _activePointer = event.pointer;
-    unawaited(_beginRecordingWithHaptic());
-  }
-
-  Future<void> _beginRecordingWithHaptic() async {
-    final started = await _controller.beginRecording();
+  Future<void> _startCall() async {
+    final started = await _controller.startCall();
     if (started && mounted) await HapticFeedback.mediumImpact();
   }
 
-  void _handlePointerUp(PointerUpEvent event) {
-    if (_activePointer != event.pointer) return;
-    _activePointer = null;
-    unawaited(HapticFeedback.selectionClick());
-    unawaited(_controller.finishRecording());
-  }
-
-  void _handlePointerCancel(PointerCancelEvent event) {
-    if (_activePointer != event.pointer) return;
-    _activePointer = null;
-    unawaited(_controller.cancelRecording());
-  }
-
-  void _handleAccessibleTap() {
-    final state = _controller.state;
-    if (state.phase == VoiceCallPhase.recording) {
-      _activePointer = null;
-      unawaited(HapticFeedback.selectionClick());
-      unawaited(_controller.finishRecording());
-    } else if (state.canStartRecording) {
-      unawaited(_beginRecordingWithHaptic());
-    }
+  Future<void> _endCallAndExit() async {
+    if (_endingFromUi) return;
+    _endingFromUi = true;
+    await HapticFeedback.selectionClick();
+    await _controller.endCall();
+    if (!mounted) return;
+    setState(() => _allowPop = true);
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    widget.onEnd();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _durationTicker?.cancel();
     _controller.removeListener(_handleControllerChanged);
-    _activePointer = null;
     _controller.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -174,43 +203,55 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      key: const Key('aanya_voice_call_screen'),
-      body: SafeArea(
-        child: AnimatedBuilder(
-          animation: _controller,
-          builder: (context, _) {
-            final state = _controller.state;
-            return Column(
-              children: [
-                _CallHeader(
-                  companion: widget.companion,
-                  connection: state.connection,
-                  onEnd: widget.onEnd,
-                ),
-                Expanded(
-                  child: _ConversationHistory(
-                    controller: _scrollController,
-                    turns: state.turns,
+    return PopScope(
+      canPop: _allowPop,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) unawaited(_endCallAndExit());
+      },
+      child: Scaffold(
+        key: const Key('aanya_voice_call_screen'),
+        body: SafeArea(
+          child: AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              final state = _controller.state;
+              return Column(
+                children: [
+                  _CallHeader(
+                    companion: widget.companion,
+                    connection: state.connection,
+                    onEnd: () => unawaited(_endCallAndExit()),
                   ),
-                ),
-                _VoiceControls(
-                  state: state,
-                  onPointerDown: _handlePointerDown,
-                  onPointerUp: _handlePointerUp,
-                  onPointerCancel: _handlePointerCancel,
-                  onAccessibleTap: _handleAccessibleTap,
-                  onRetryConnection: () {
-                    unawaited(_controller.retryConnection());
-                  },
-                  onClearError: _controller.clearRecoverableError,
-                ),
-              ],
-            );
-          },
+                  Expanded(
+                    child: _ConversationHistory(
+                      controller: _scrollController,
+                      turns: state.turns,
+                    ),
+                  ),
+                  _VoiceControls(
+                    state: state,
+                    duration: _callDuration(state),
+                    onStartCall: () => unawaited(_startCall()),
+                    onEndCall: () => unawaited(_endCallAndExit()),
+                    onRetryConnection: () {
+                      unawaited(_controller.retryConnection());
+                    },
+                    onClearError: _controller.clearRecoverableError,
+                  ),
+                ],
+              );
+            },
+          ),
         ),
       ),
     );
+  }
+
+  Duration _callDuration(VoiceCallState state) {
+    final startedAt = state.callStartedAt;
+    if (startedAt == null) return Duration.zero;
+    final elapsed = DateTime.now().difference(startedAt);
+    return elapsed.isNegative ? Duration.zero : elapsed;
   }
 }
 
@@ -370,7 +411,7 @@ class _ConversationHistory extends StatelessWidget {
               ),
               const SizedBox(height: AppSpacing.md),
               Text(
-                'Hold the microphone and speak naturally.',
+                'Start the call, then speak naturally when Aanya is listening.',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.titleMedium
                     ?.copyWith(fontWeight: FontWeight.w700),
@@ -489,19 +530,17 @@ class _MessageBubble extends StatelessWidget {
 class _VoiceControls extends StatelessWidget {
   const _VoiceControls({
     required this.state,
-    required this.onPointerDown,
-    required this.onPointerUp,
-    required this.onPointerCancel,
-    required this.onAccessibleTap,
+    required this.duration,
+    required this.onStartCall,
+    required this.onEndCall,
     required this.onRetryConnection,
     required this.onClearError,
   });
 
   final VoiceCallState state;
-  final PointerDownEventListener onPointerDown;
-  final PointerUpEventListener onPointerUp;
-  final PointerCancelEventListener onPointerCancel;
-  final VoidCallback onAccessibleTap;
+  final Duration duration;
+  final VoidCallback onStartCall;
+  final VoidCallback onEndCall;
   final VoidCallback onRetryConnection;
   final VoidCallback onClearError;
 
@@ -509,23 +548,11 @@ class _VoiceControls extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final isRecording = state.phase == VoiceCallPhase.recording;
-    final canInteract = state.canStartRecording || isRecording;
-    final micLabel = isRecording
-        ? 'Release to send'
-        : state.canStartRecording
-        ? 'Hold to talk'
-        : 'Microphone unavailable';
-    final micColor = isRecording
-        ? colors.error
-        : state.canStartRecording
-        ? colors.primary
-        : colors.surfaceContainerHighest;
-    final micForeground = isRecording
-        ? colors.onError
-        : state.canStartRecording
-        ? colors.onPrimary
-        : colors.onSurfaceVariant;
+    final active = state.callActive;
+    final busy =
+        state.phase == VoiceCallPhase.connecting ||
+        state.phase == VoiceCallPhase.reconnecting ||
+        state.phase == VoiceCallPhase.ending;
 
     return Material(
       color: colors.surface,
@@ -549,8 +576,7 @@ class _VoiceControls extends StatelessWidget {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    if (state.phase == VoiceCallPhase.checkingConnection ||
-                        state.phase == VoiceCallPhase.processing)
+                    if (busy)
                       const SizedBox.square(
                         dimension: 16,
                         child: CircularProgressIndicator(strokeWidth: 2),
@@ -616,53 +642,44 @@ class _VoiceControls extends StatelessWidget {
               ),
             ],
             const SizedBox(height: AppSpacing.sm),
-            Semantics(
-              button: true,
-              enabled: canInteract,
-              label: isRecording
-                  ? 'Stop recording and send to Aanya'
-                  : 'Hold to record a message for Aanya. Double tap to start '
-                        'or stop with TalkBack.',
-              onTap: canInteract ? onAccessibleTap : null,
-              child: ExcludeSemantics(
-                child: Listener(
-                  key: const Key('aanya_microphone_control'),
-                  behavior: HitTestBehavior.opaque,
-                  onPointerDown: canInteract ? onPointerDown : null,
-                  onPointerUp: canInteract ? onPointerUp : null,
-                  onPointerCancel: canInteract ? onPointerCancel : null,
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 180),
-                    width: 96,
-                    height: 96,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: micColor,
-                      boxShadow: canInteract
-                          ? [
-                              BoxShadow(
-                                color: micColor.withValues(alpha: 0.3),
-                                blurRadius: isRecording ? 28 : 18,
-                                spreadRadius: isRecording ? 5 : 1,
-                              ),
-                            ]
-                          : null,
-                    ),
-                    child: Icon(
-                      isRecording ? Icons.stop_rounded : Icons.mic_rounded,
-                      size: 42,
-                      color: micForeground,
-                    ),
-                  ),
+            if (active) ...[
+              Text(
+                _formatDuration(duration),
+                key: const Key('aanya_call_duration'),
+                style: theme.textTheme.titleLarge?.copyWith(
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-            ),
+              const SizedBox(height: AppSpacing.sm),
+              FilledButton.icon(
+                key: const Key('aanya_end_call_button'),
+                onPressed: state.phase == VoiceCallPhase.ending
+                    ? null
+                    : onEndCall,
+                style: FilledButton.styleFrom(
+                  backgroundColor: colors.error,
+                  foregroundColor: colors.onError,
+                  minimumSize: const Size(190, 54),
+                ),
+                icon: const Icon(Icons.call_end_rounded),
+                label: const Text('END CALL'),
+              ),
+            ] else ...[
+              FilledButton.icon(
+                key: const Key('aanya_start_call'),
+                onPressed: state.canStartCall ? onStartCall : null,
+                style: FilledButton.styleFrom(minimumSize: const Size(190, 54)),
+                icon: const Icon(Icons.call_rounded),
+                label: const Text('START CALL'),
+              ),
+            ],
             const SizedBox(height: AppSpacing.xs),
             Text(
-              micLabel,
-              style: theme.textTheme.labelLarge?.copyWith(
-                color: canInteract ? colors.onSurface : colors.onSurfaceVariant,
-                fontWeight: FontWeight.w700,
+              active ? 'The call stays active until you end it.' : 'Aanya is an AI companion, not a human or emergency service.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: colors.onSurfaceVariant,
               ),
             ),
           ],
@@ -672,12 +689,28 @@ class _VoiceControls extends StatelessWidget {
   }
 
   static IconData _statusIcon(VoiceCallPhase phase) => switch (phase) {
+    VoiceCallPhase.listening ||
     VoiceCallPhase.recording => Icons.hearing_rounded,
-    VoiceCallPhase.playing => Icons.volume_up_rounded,
+    VoiceCallPhase.speaking ||
+    VoiceCallPhase.playing => Icons.graphic_eq_rounded,
     VoiceCallPhase.error => Icons.info_outline_rounded,
     VoiceCallPhase.disposed => Icons.close_rounded,
-    VoiceCallPhase.idle => Icons.mic_none_rounded,
+    VoiceCallPhase.idle ||
+    VoiceCallPhase.ready ||
+    VoiceCallPhase.ended => Icons.call_rounded,
+    VoiceCallPhase.ending => Icons.call_end_rounded,
+    VoiceCallPhase.thinking ||
+    VoiceCallPhase.finalizingUserTurn => Icons.psychology_alt_rounded,
+    VoiceCallPhase.connecting ||
+    VoiceCallPhase.reconnecting => Icons.sync_rounded,
     VoiceCallPhase.checkingConnection ||
     VoiceCallPhase.processing => Icons.sync_rounded,
   };
+
+  static String _formatDuration(Duration duration) {
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
 }

@@ -207,16 +207,51 @@ The realtime path additionally measures:
 These timestamps are observations of real boundaries. Missing work is reported
 as unavailable rather than synthesized or estimated.
 
+## Continuous call, endpointing, and cancellation
+
+The canonical first-output normalizer also coalesces standalone whitespace-only
+LLM deltas. This matters for formatted math: llama-server may stream a newline
+as its own SSE delta, while protocol `text_delta` deliberately requires
+meaningful text. The newline is retained and prepended to the next meaningful
+delta before the same normalized stream feeds display and TTS. Decimal points
+followed by digits are not sentence boundaries, and UTF-8 math characters are
+bounded by Unicode scalar count for text rather than confused with byte length.
+
+Cancellation first invalidates the local turn and stops `AudioRecord` and
+`AudioTrack`. Server output for the cancelled turn is then suppressed, including
+misbehaving late adapter output, and a cleanup deadline prevents a slow model
+hook from delaying `turn_cancelled`. The Android client waits at most 400 ms for
+that acknowledgement; on timeout it closes the socket and performs a new
+handshake instead of remaining in a buffering state.
+
+The explicit call state machine is independent of route lifecycle. After Start
+Call, native capture restarts automatically after each authoritative AudioTrack
+drain. Three consecutive voiced frames confirm onset; a 400 ms bounded PCM ring
+is prepended once, and 3,000 ms of post-speech silence finalizes exactly once.
+Only 200 ms of trailing silence is retained for the final phoneme, avoiding a
+known-silence penalty in batch STT. Before onset, silence creates no server turn.
+
+The Android microphone foreground service owns active-call intent, generation,
+audio focus, AudioRecord, AudioTrack, wake lock, and the ongoing AI-labelled
+notification. The Dart call-session controller owns the versioned protocol
+socket while its process is alive. Flutter Activity backgrounding is not an End
+Call signal. Explicit End Call or an unrecoverable process condition releases
+the native and transport resources; stale callbacks are generation-rejected.
+
 ## Current limitations and performance blockers
 
-The route, state machine, framing, and client parser are mock-tested
-foundations. The default server deliberately advertises
+The route, state machine, framing, client parser, native Android `AudioRecord`
+capture, lifecycle behavior, ordered WebSocket writes, and streamed playback
+controller are mock-tested. Production capture no longer uses
+`record.startStream`; `record` remains for permission and HTTP fallback only.
+The default server deliberately advertises
 `can_process_turns: false`. An opt-in production
 `StreamingRealtimeTurnProcessor` factory is now available for the Pocket worker;
 it is selected only through explicit environment configuration and successful
-readiness. The Flutter realtime client is still not connected to the existing
-call-screen microphone and playback flow; that screen continues to use the
-compatible HTTP path.
+readiness. The Flutter Aanya call screen is connected to the persistent
+realtime path and uses Start Call / End Call with automatic endpointing and
+automatic return to listening. The compatible HTTP path remains an explicit
+fallback/debug path.
 
 - **STT:** Faster-Whisper is currently batch-oriented; the adapter boundary is
   ready for true incremental transcription, but rolling-window work must be
@@ -231,15 +266,21 @@ compatible HTTP path.
   trusted-LAN WebSocket without TLS/authentication is development-only.
 - **Hardware:** 8 GB Turing hardware restricts precision and optimized attention
   options for the validated Qwen setup.
-- **Android playback:** continuous PCM capture, jitter buffering, early playback,
-  and barge-in still need device-level integration and measurement.
+- **Android input:** native capture and route behavior still require the
+  two-phone, USB-disconnected acceptance run. Zero-byte capture now fails
+  recoverably within about one second instead of hanging indefinitely.
+- **Android playback:** the app now feeds validated, ordered PCM to a native
+  streaming `AudioTrack` and drains it after `turn_complete`. Device-level
+  underrun, route, acoustic-echo, and playback-start timing still need physical
+  verification. Conversational barge-in remains intentionally out of scope;
+  explicit cancellation is supported.
 
 The most useful next experiment is an end-to-end Pocket worker smoke and timing
 run through the real WebSocket, followed by repeated TTFA trials. Measure STT,
-process-per-turn llama.cpp TTFT, first phrase availability, worker IPC, first
+the persistent llama-server TTFT, first phrase availability, worker IPC, first
 binary send, and Android playback separately. Pocket's first TTS chunk is now
-unlikely to be the largest latency term; the complete-response llama.cpp adapter
-and batch STT are the leading architectural blockers to sub-second TTFA.
+unlikely to be the largest latency term; batch STT and first speakable phrase
+availability remain leading architectural blockers to sub-second TTFA.
 
 ## Local diagnostics
 

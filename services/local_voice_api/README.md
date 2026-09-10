@@ -232,8 +232,8 @@ Name normalization changes the whole-word STT variants `Anna`, `Anya`, and
 
 ## Milestone 5A: trusted local HTTP bridge
 
-Milestone 5A exposes the existing one-turn orchestration to a future Android
-push-to-talk client. The API does not recreate or alter STT, llama.cpp, or TTS:
+Milestone 5A exposes the existing one-turn orchestration as the Android
+client's fallback/debug path. The API does not recreate or alter STT, llama.cpp, or TTS:
 it stores a validated upload and calls `run_conversation_turn()` once. Flutter
 is not connected yet.
 
@@ -331,6 +331,12 @@ waits for an in-progress in-process model load because Python thread
 cancellation cannot safely stop it. Do not enable this switch during routine
 tests.
 
+For the Pocket plus persistent llama-server composition, opt-in warmup now
+executes each cold boundary with bounded synthetic data: one second of silent
+PCM through Faster-Whisper, a two-token llama-server completion, and a short
+Pocket synthesis whose PCM is discarded. None is audible or stored as user
+history. `/ready` changes to ready only after those executions finish.
+
 ### Pocket TTS realtime worker
 
 Pocket TTS 3.1.0 runs in its existing dedicated Windows Python 3.13 / PyTorch
@@ -348,6 +354,7 @@ $env:PYTHONPATH="E:\female-voice-ai\services\local_voice_api\src"
 $env:AIRA_POCKET_TTS_VOICE_STATE="E:\aira-local-runtime\pocket-tts\aanya_voice.safetensors"
 $env:AIRA_POCKET_TTS_CACHE_ROOT="E:\aira-local-runtime\pocket-tts\cache"
 $env:AIRA_POCKET_TTS_OFFLINE="1"
+$env:AIRA_POCKET_TTS_MAX_QUEUE="8"
 & "E:\aira-local-runtime\venvs\pocket-tts\Scripts\python.exe" -m local_voice_api.pocket_tts_worker --host 127.0.0.1 --port 8766
 ```
 
@@ -360,8 +367,11 @@ cd /mnt/e/female-voice-ai
 source /mnt/e/aira-local-runtime/activate.sh
 AIRA_REALTIME_TTS_PROVIDER=pocket_worker \
 AIRA_POCKET_TTS_WORKER_URL=http://127.0.0.1:8766 \
+AIRA_REALTIME_LLM_PROVIDER=llama_server \
+AIRA_LLAMA_SERVER_URL=http://127.0.0.1:8767 \
+AIRA_REALTIME_STT_CONCURRENCY=1 \
 AIRA_MODEL_WARMUP=1 \
-python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 8765
+python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 18765
 ```
 
 This localhost path requires WSL networking that can reach the Windows
@@ -376,6 +386,12 @@ backend readiness unavailable. `/ready` and each realtime handshake repeat the
 lightweight worker status/format probe, so a worker that exits after warmup is
 not advertised as currently usable. The Qwen HTTP conversation implementation
 is unchanged and remains available as before.
+
+The fixed development topology keeps Pocket on loopback `127.0.0.1:8766`,
+llama-server on loopback `127.0.0.1:8767`, and Aira on `0.0.0.0:18765`.
+Windows Tailscale Serve owns external port 8765 and forwards it to
+`127.0.0.1:18765`. Neither model worker is exposed, and the Tailscale address
+remains a build-time app setting rather than source code.
 
 The versioned endpoint is `ws://<trusted-host>:8765/v1/realtime`. The first text
 frame must be `session_start` with `protocol_version: 1`, `companion: "aanya"`,
@@ -394,13 +410,32 @@ header is immediately followed by its binary PCM16 frame. Output is mono PCM16
 at a declared 8–48 kHz rate, starts at sequence zero, and remains bounded to 64
 KiB per frame.
 
-The production app still uses the existing HTTP Aanya screen. No realtime
-processor is enabled by default. Explicitly selecting `pocket_worker` composes
+At the start of each LLM response, one canonical streaming normalizer briefly
+buffers only enough text to distinguish a leading `Aanya:` or `Assistant:`
+speaker label (including dash separators). It strips that label before both
+display events and speakable/TTS chunking, while leaving ordinary and explicit
+identity sentences such as `My name is Aanya.` unchanged.
+Standalone whitespace/newline model deltas are held until meaningful text
+arrives instead of being emitted as invalid empty protocol events. Newlines are
+then preserved inside that canonical meaningful delta, including Markdown and
+multiline mathematical output.
+
+The production Android Aanya screen now uses this realtime endpoint; the HTTP
+controller remains available as a fallback/debug path. No realtime processor is
+enabled by default. Explicitly selecting `pocket_worker` composes
 the existing bounded batch STT and complete-response llama.cpp adapters with
 the streaming Pocket synthesizer; no WebSocket protocol or Flutter behavior is
 changed. Pocket audio is forwarded as 24 kHz mono PCM16 as soon as each genuine
-`generate_audio_stream` chunk arrives. The worker is single-flight and rejects
-concurrent synthesis instead of creating an unbounded queue.
+`generate_audio_stream` chunk arrives. Generation remains deliberately
+single-flight. Concurrent requests wait in a cancellation-aware FIFO bounded
+to eight queued requests by default (`AIRA_POCKET_TTS_MAX_QUEUE`); a full queue
+returns `429 worker_queue_full`, while normal contention no longer returns an
+immediate `409 worker_busy`.
+
+Realtime STT admission is shared across sessions and defaults to one active
+transcription (`AIRA_REALTIME_STT_CONCURRENCY=1`). Queue waiting is
+cancellation-aware. `/ready` and handshake readiness include content-free STT
+and Pocket queue depth/capacity diagnostics.
 
 Cancellation invalidates the adapter generation, closes the active stream, and
 sends the active turn ID to the worker. Both sides check cancellation between
@@ -415,14 +450,17 @@ boundaries are reached. Realtime `turn_complete.metrics` measures STT final,
 TTFT, first speakable text, first synthesized sample (`ttfas_ms`), first binary
 audio successfully sent (`ttfa_ms`), and total time from server `end_of_turn`.
 Logs contain generated IDs and numeric/safe fields, not audio or transcript text.
+Receive diagnostics correlate connection/session/turn IDs with PCM frame count,
+byte count, first/last receipt, accepted end-of-turn, and STT start/end.
 
 The existing Qwen measurements remain: cold model load 202.8 seconds, cold full
 conversation about 329 seconds, and warm full conversation 104.956 seconds.
 The separate Pocket benchmark measured 128.86/130.81/152.59 ms
 min/median/max first playable TTS audio, 106.69 ms for the short phrase, and a
 median RTF of about 0.394. Those are TTS-only Windows CPU measurements, not an
-end-to-end Aira TTFA result. STT, process-per-turn llama.cpp, phrase availability,
-IPC, WebSocket delivery, and Android playback still must be measured together.
+end-to-end Aira TTFA result. STT, persistent llama-server TTFT, phrase availability,
+IPC, WebSocket delivery, and Android playback still must be measured together
+on a physical phone.
 
 For a manual end-to-end smoke test, provide a non-sensitive uncompressed 16 kHz
 mono PCM16 input WAV and run this after both readiness checks return HTTP 200:

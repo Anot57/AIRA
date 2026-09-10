@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -230,7 +231,7 @@ class PocketTtsWorkerTests(unittest.TestCase):
         runtime._voice_state = object()
         return runtime, model
 
-    def test_runtime_reuses_model_and_voice_and_has_no_generation_queue(self) -> None:
+    def test_runtime_reuses_model_and_voice_and_admits_fifo_queue(self) -> None:
         runtime, model = self._ready_runtime()
         with mock.patch.object(
             worker_module, "_tensor_to_pcm16", return_value=b"\x01\x00"
@@ -238,24 +239,39 @@ class PocketTtsWorkerTests(unittest.TestCase):
             first = runtime.stream_pcm("turn_1", "a" * 32, "First sentence.")
             self.assertEqual(b"\x01\x00", next(first))
             second = runtime.stream_pcm("turn_2", "b" * 32, "Second sentence.")
-            with self.assertRaises(worker_module.WorkerRequestError) as captured:
-                next(second)
-            self.assertEqual(409, captured.exception.status)
+            rendered: list[bytes] = []
+            waiter = threading.Thread(target=lambda: rendered.extend(second))
+            waiter.start()
+            for _ in range(100):
+                if runtime.snapshot()["queue_depth"] == 1:
+                    break
+                time.sleep(0.005)
+            self.assertEqual(1, runtime.snapshot()["queue_depth"])
             self.assertTrue(runtime.cancel("turn_1"))
             with self.assertRaises(StopIteration):
                 next(first)
+            waiter.join(timeout=1)
+            self.assertFalse(waiter.is_alive())
 
-        self.assertEqual(1, len(model.calls))
+        self.assertEqual([b"\x01\x00", b"\x01\x00"], rendered)
+        self.assertEqual(2, len(model.calls))
         self.assertTrue(model.calls[0][2])
         self.assertFalse(runtime.snapshot()["busy"])
+        self.assertEqual(0, runtime.snapshot()["queue_depth"])
 
     def test_runtime_splits_worker_pcm_into_bounded_even_frames(self) -> None:
         runtime, _model = self._ready_runtime()
         oversized = b"\x01\x00" * (worker_module.MAX_PCM_FRAME_BYTES // 2 + 10)
         with mock.patch.object(
             worker_module, "_tensor_to_pcm16", return_value=oversized
-        ):
-            frames = list(runtime.stream_pcm("turn_1", "c" * 32, "Hello."))
+        ), self.assertLogs(
+            "local_voice_api.pocket_tts_worker", level="INFO"
+        ) as captured:
+            frames = list(
+                runtime.stream_pcm(
+                    "turn_1", "c" * 32, "Hello.", generation=7
+                )
+            )
 
         self.assertEqual(oversized * 2, b"".join(frames))
         self.assertTrue(all(frame for frame in frames))
@@ -263,6 +279,54 @@ class PocketTtsWorkerTests(unittest.TestCase):
             all(len(frame) <= worker_module.MAX_PCM_FRAME_BYTES for frame in frames)
         )
         self.assertTrue(all(len(frame) % 2 == 0 for frame in frames))
+        logs = "\n".join(captured.output)
+        self.assertIn("event=tts_queue_enter", logs)
+        self.assertIn("event=tts_start", logs)
+        self.assertIn("event=tts_first_pcm", logs)
+        self.assertIn("turn_id=turn_1", logs)
+        self.assertIn("generation=7", logs)
+        self.assertNotIn("Hello.", logs)
+
+    def test_worker_queue_is_bounded_and_queued_turn_can_cancel(self) -> None:
+        runtime = worker_module.PocketTtsRuntime(
+            Path("voice"), Path("cache"), max_queued_requests=1
+        )
+        model = _FakeModel()
+        runtime._status = "ready"
+        runtime._model = model
+        runtime._voice_state = object()
+        waiter_errors: list[worker_module.WorkerRequestError] = []
+        with mock.patch.object(
+            worker_module, "_tensor_to_pcm16", return_value=b"\x01\x00"
+        ):
+            active = runtime.stream_pcm("turn_active", "a" * 32, "Active.")
+            next(active)
+            queued = runtime.stream_pcm("turn_queued", "b" * 32, "Queued.")
+
+            def wait_for_queue() -> None:
+                try:
+                    next(queued)
+                except worker_module.WorkerRequestError as error:
+                    waiter_errors.append(error)
+
+            waiter = threading.Thread(target=wait_for_queue)
+            waiter.start()
+            for _ in range(100):
+                if runtime.snapshot()["queue_depth"] == 1:
+                    break
+                time.sleep(0.005)
+            overload = runtime.stream_pcm("turn_overload", "c" * 32, "Full.")
+            with self.assertRaises(worker_module.WorkerRequestError) as captured:
+                next(overload)
+            self.assertEqual(429, captured.exception.status)
+            self.assertEqual("worker_queue_full", captured.exception.code)
+            self.assertTrue(runtime.cancel("turn_queued"))
+            waiter.join(timeout=1)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual("request_cancelled", waiter_errors[0].code)
+            self.assertTrue(runtime.cancel("turn_active"))
+            with self.assertRaises(StopIteration):
+                next(active)
 
     def test_initialize_loads_model_and_cached_voice_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory(dir=SERVICE_ROOT) as temporary:

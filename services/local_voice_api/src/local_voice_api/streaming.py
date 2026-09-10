@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import threading
+import time
 import wave
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -20,6 +22,85 @@ from .realtime_protocol import (
 
 _STAGE_DIRECTION = re.compile(r"(?:\*[^*\n]+\*|\[[^\]\n]+\])")
 _SENTENCE_BOUNDARY = re.compile(r"[.!?;:]\s|\n")
+_LOGGER = logging.getLogger(__name__)
+
+
+class LeadingSpeakerLabelNormalizer:
+    """Canonicalize the first streamed LLM text without emitting blank deltas."""
+
+    _LABELS = ("aanya", "assistant")
+    _SEPARATORS = (":", "-", "—")
+    _MAX_PREFIX_CHARACTERS = 32
+    _MAX_PENDING_WHITESPACE = 32
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._decided = False
+        self._pending_whitespace = ""
+
+    def feed(self, delta: str) -> str:
+        if not isinstance(delta, str):
+            raise TypeError("LLM deltas must be strings.")
+        if self._decided:
+            return self._emit_meaningful(delta)
+        self._buffer += delta
+        return self._decide(final=False)
+
+    def finish(self) -> str:
+        if self._decided:
+            self._pending_whitespace = ""
+            return ""
+        return self._decide(final=True)
+
+    def _decide(self, *, final: bool) -> str:
+        candidate = self._buffer.lstrip()
+        leading_characters = len(self._buffer) - len(candidate)
+        folded = candidate.casefold()
+
+        if not candidate:
+            if not final and len(self._buffer) < self._MAX_PREFIX_CHARACTERS:
+                return ""
+            return self._flush_unchanged()
+
+        matching_label = next(
+            (label for label in self._LABELS if folded.startswith(label)), None
+        )
+        if matching_label is not None:
+            remainder = candidate[len(matching_label) :]
+            punctuation = remainder.lstrip()
+            if not punctuation:
+                if not final and len(self._buffer) < self._MAX_PREFIX_CHARACTERS:
+                    return ""
+                return self._flush_unchanged()
+            if punctuation[0] in self._SEPARATORS:
+                normalized = punctuation[1:].lstrip()
+                self._buffer = ""
+                self._decided = True
+                return self._emit_meaningful(normalized)
+            return self._flush_unchanged()
+
+        could_be_partial_label = any(label.startswith(folded) for label in self._LABELS)
+        if (
+            could_be_partial_label
+            and not final
+            and leading_characters + len(candidate) < self._MAX_PREFIX_CHARACTERS
+        ):
+            return ""
+        return self._flush_unchanged()
+
+    def _flush_unchanged(self) -> str:
+        buffered = self._buffer
+        self._buffer = ""
+        self._decided = True
+        return self._emit_meaningful(buffered)
+
+    def _emit_meaningful(self, text: str) -> str:
+        combined = f"{self._pending_whitespace}{text}"
+        if not combined.strip():
+            self._pending_whitespace = combined[-self._MAX_PENDING_WHITESPACE :]
+            return ""
+        self._pending_whitespace = ""
+        return combined
 
 
 class NoSpeechDetectedError(RuntimeError):
@@ -34,6 +115,22 @@ class RealtimeInferenceUnavailableError(RuntimeError):
 class StreamingTranscript:
     text: str
     is_final: bool
+    stt_queue_enter_us: int | None = None
+    stt_start_us: int | None = None
+    stt_complete_us: int | None = None
+    stt_queue_wait_ms: float | None = None
+    stt_duration_ms: float | None = None
+    segment_count: int | None = None
+    stt_no_speech_probability: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FinalTranscriptionResult:
+    """Content-free diagnostics returned by a batch STT implementation."""
+
+    text: str
+    segment_count: int | None = None
+    stt_no_speech_probability: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,16 +239,20 @@ class BoundedBatchTranscriberSession:
 
     def __init__(
         self,
-        final_transcriber: Callable[[bytes, PcmAudioFormat], str],
+        final_transcriber: Callable[
+            [bytes, PcmAudioFormat], str | FinalTranscriptionResult
+        ],
         audio_format: PcmAudioFormat,
         *,
         max_audio_bytes: int = MAX_TURN_AUDIO_BYTES,
+        admission: SttAdmissionController | None = None,
     ) -> None:
         if type(max_audio_bytes) is not int or max_audio_bytes <= 0:
             raise ValueError("Streaming transcription buffer limit must be positive.")
         self._final_transcriber = final_transcriber
         self._audio_format = audio_format
         self._max_audio_bytes = max_audio_bytes
+        self._admission = admission
         self._audio = bytearray()
         self._cancelled = False
         self._closed = False
@@ -174,15 +275,47 @@ class BoundedBatchTranscriberSession:
         audio = bytes(self._audio)
         self._audio.clear()
         self._closed = True
-        text = await asyncio.to_thread(
-            self._final_transcriber, audio, self._audio_format
-        )
+        wait_started = time.perf_counter()
+        queue_enter_us = time.perf_counter_ns() // 1_000
+        if self._admission is not None:
+            await self._admission.acquire(lambda: self._cancelled)
+        stt_start_us = time.perf_counter_ns() // 1_000
+        queue_wait_ms = (time.perf_counter() - wait_started) * 1000
+        _LOGGER.info("Realtime STT admitted queue_wait_ms=%.3f", queue_wait_ms)
+        try:
+            stt_started = time.perf_counter()
+            result = await asyncio.to_thread(
+                self._final_transcriber, audio, self._audio_format
+            )
+            stt_complete_us = time.perf_counter_ns() // 1_000
+            stt_duration_ms = (time.perf_counter() - stt_started) * 1000
+        finally:
+            if self._admission is not None:
+                self._admission.release()
         if self._cancelled:
             raise asyncio.CancelledError
+        if isinstance(result, FinalTranscriptionResult):
+            text = result.text
+            segment_count = result.segment_count
+            no_speech_probability = result.stt_no_speech_probability
+        else:
+            text = result
+            segment_count = None
+            no_speech_probability = None
         normalized = text.strip() if isinstance(text, str) else ""
         if not normalized:
             raise NoSpeechDetectedError("No speech was detected in this turn.")
-        return StreamingTranscript(text=normalized, is_final=True)
+        return StreamingTranscript(
+            text=normalized,
+            is_final=True,
+            stt_queue_enter_us=queue_enter_us,
+            stt_start_us=stt_start_us,
+            stt_complete_us=stt_complete_us,
+            stt_queue_wait_ms=round(queue_wait_ms, 3),
+            stt_duration_ms=round(stt_duration_ms, 3),
+            segment_count=segment_count,
+            stt_no_speech_probability=no_speech_probability,
+        )
 
     async def cancel(self) -> None:
         self._audio.clear()
@@ -202,14 +335,18 @@ class BoundedBatchTranscriberSession:
 class BoundedBatchStreamingTranscriber:
     def __init__(
         self,
-        final_transcriber: Callable[[bytes, PcmAudioFormat], str],
+        final_transcriber: Callable[
+            [bytes, PcmAudioFormat], str | FinalTranscriptionResult
+        ],
         *,
         max_audio_bytes: int = MAX_TURN_AUDIO_BYTES,
+        admission: SttAdmissionController | None = None,
     ) -> None:
         if type(max_audio_bytes) is not int or max_audio_bytes <= 0:
             raise ValueError("Streaming transcription buffer limit must be positive.")
         self._final_transcriber = final_transcriber
         self._max_audio_bytes = max_audio_bytes
+        self._admission = admission
 
     async def start_session(
         self, audio_format: PcmAudioFormat
@@ -218,7 +355,48 @@ class BoundedBatchStreamingTranscriber:
             self._final_transcriber,
             audio_format,
             max_audio_bytes=self._max_audio_bytes,
+            admission=self._admission,
         )
+
+
+class SttAdmissionController:
+    """Shared bounded STT admission with cancellation-aware queue waiting."""
+
+    def __init__(self, concurrency: int = 1) -> None:
+        if type(concurrency) is not int or concurrency <= 0 or concurrency > 16:
+            raise ValueError("STT concurrency must be between 1 and 16.")
+        self.concurrency = concurrency
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self.active = 0
+        self.waiting = 0
+
+    async def acquire(self, cancelled: Callable[[], bool]) -> None:
+        self.waiting += 1
+        try:
+            while True:
+                if cancelled():
+                    raise asyncio.CancelledError
+                try:
+                    await asyncio.wait_for(self._semaphore.acquire(), timeout=0.05)
+                    self.active += 1
+                    return
+                except TimeoutError:
+                    continue
+        finally:
+            self.waiting -= 1
+
+    def release(self) -> None:
+        if self.active <= 0:
+            raise RuntimeError("STT admission release was unbalanced.")
+        self.active -= 1
+        self._semaphore.release()
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "concurrency": self.concurrency,
+            "active": self.active,
+            "queued": self.waiting,
+        }
 
 
 class CompleteResponseStreamingLlmAdapter:

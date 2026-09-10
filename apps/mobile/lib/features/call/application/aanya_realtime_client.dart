@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
@@ -98,6 +99,30 @@ final class RealtimeAudioFrame {
 
 typedef ReconnectDelay = Future<void> Function(Duration duration);
 
+final class RealtimeProtocolViolation {
+  const RealtimeProtocolViolation({
+    required this.code,
+    required this.expectedEvent,
+    required this.receivedEvent,
+    required this.expectedSequence,
+    required this.receivedSequence,
+    required this.sessionId,
+    required this.turnId,
+    required this.textSequence,
+    required this.audioSequence,
+  });
+
+  final String code;
+  final String? expectedEvent;
+  final String? receivedEvent;
+  final int? expectedSequence;
+  final int? receivedSequence;
+  final String? sessionId;
+  final String? turnId;
+  final int textSequence;
+  final int audioSequence;
+}
+
 /// Owns one Aanya-only realtime WebSocket session.
 ///
 /// Whole-WAV HTTP remains implemented by [AanyaVoiceCallController]. This
@@ -110,6 +135,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     RealtimeWebSocketConnector? connector,
     this.handshakeTimeout = const Duration(seconds: 10),
     this.closeTimeout = const Duration(seconds: 2),
+    this.cancelAckTimeout = const Duration(milliseconds: 400),
     this.maxTurnAudioBytes = AiraRealtimeProtocol.maxTurnAudioBytes,
     List<Duration> reconnectDelays = const <Duration>[
       Duration(milliseconds: 500),
@@ -118,6 +144,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       Duration(seconds: 4),
     ],
     ReconnectDelay? reconnectDelay,
+    this.repeatLastReconnectDelay = true,
   }) : _uri = config.realtimeUri,
        _connector = connector ?? const IoRealtimeWebSocketConnector(),
        _reconnectDelay = reconnectDelay ?? _defaultReconnectDelay,
@@ -131,6 +158,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
     if (handshakeTimeout <= Duration.zero ||
         closeTimeout <= Duration.zero ||
+        cancelAckTimeout <= Duration.zero ||
         maxTurnAudioBytes <= 0 ||
         maxTurnAudioBytes > AiraRealtimeProtocol.maxTurnAudioBytes ||
         reconnectDelays.any((delay) => delay.isNegative)) {
@@ -143,8 +171,10 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   final ReconnectDelay _reconnectDelay;
   final Duration handshakeTimeout;
   final Duration closeTimeout;
+  final Duration cancelAckTimeout;
   final int maxTurnAudioBytes;
   final List<Duration> reconnectDelays;
+  final bool repeatLastReconnectDelay;
 
   final StreamController<RealtimeServerEvent> _eventController =
       StreamController<RealtimeServerEvent>.broadcast(sync: true);
@@ -156,24 +186,35 @@ final class AanyaRealtimeClient extends ChangeNotifier {
 
   Stream<RealtimeServerEvent> get events => _eventController.stream;
   Stream<RealtimeAudioFrame> get audioFrames => _audioController.stream;
+  RealtimeProtocolViolation? get lastProtocolViolation =>
+      _lastProtocolViolation;
 
   RealtimeWebSocket? _socket;
   StreamSubscription<Object?>? _socketSubscription;
   Future<void>? _connectInFlight;
   Future<void>? _reconnectInFlight;
+  Completer<bool>? _cancelAcknowledgement;
   Timer? _handshakeTimer;
   RealtimeAudioChunkEvent? _pendingServerAudio;
   var _connectionGeneration = 0;
   var _reconnectAttempt = 0;
   var _nextServerAudioSequence = 0;
   var _nextServerSentenceSequence = 1;
+  int? _playbackSampleRateHz;
   var _turnAudioBytes = 0;
+  var _queuedTurnAudioBytes = 0;
+  Future<void> _writeTail = Future<void>.value();
+  var _writeGeneration = 0;
+  var _serverAudioBytes = 0;
   var _turnActive = false;
   String? _activeServerTurnId;
+  String? _cancellingServerTurnId;
+  RealtimeProtocolViolation? _lastProtocolViolation;
   var _allowReconnect = false;
   var _isForeground = true;
   var _disposed = false;
   Future<void> _shutdownComplete = Future<void>.value();
+  final Stopwatch _monotonicClock = Stopwatch()..start();
 
   Future<void> get shutdownComplete => _shutdownComplete;
 
@@ -181,7 +222,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   /// the handshake was sent; only session_ready transitions the client to
   /// [AanyaRealtimePhase.ready].
   Future<void> connect() {
-    if (_disposed || !_isForeground) return Future<void>.value();
+    if (_disposed) return Future<void>.value();
     _allowReconnect = true;
     if (_socket != null) return Future<void>.value();
     final existing = _connectInFlight;
@@ -195,7 +236,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         if (identical(_connectInFlight, operation)) {
           _connectInFlight = null;
         }
-        if (!_disposed && _allowReconnect && _isForeground && _socket == null) {
+        if (!_disposed && _allowReconnect && _socket == null) {
           _scheduleReconnect();
         }
       }),
@@ -204,6 +245,8 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   }
 
   Future<void> _connectOnce(int generation) async {
+    _timing('websocket_connect_start', generation);
+    _lastProtocolViolation = null;
     _emit(
       _state.copyWith(
         phase: _reconnectAttempt == 0
@@ -236,6 +279,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
 
     _socket = socket;
+    _timing('websocket_open', generation);
     _socketSubscription = socket.messages.listen(
       (message) => _handleSocketMessage(socket, generation, message),
       onError: (Object error, StackTrace stackTrace) {
@@ -282,6 +326,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     _pendingServerAudio = null;
     _nextServerAudioSequence = 0;
     _nextServerSentenceSequence = 1;
+    _serverAudioBytes = 0;
     _emit(
       _state.copyWith(
         phase: AanyaRealtimePhase.listening,
@@ -328,6 +373,90 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
   }
 
+  /// Serializes a microphone frame behind all earlier frames and completes
+  /// only after the socket sink has accepted it.
+  Future<bool> sendPcm16ChunkOrdered(Uint8List bytes) {
+    if (_disposed ||
+        !_turnActive ||
+        _state.phase != AanyaRealtimePhase.listening ||
+        _socket == null ||
+        bytes.isEmpty ||
+        bytes.length > AiraRealtimeProtocol.maxFrameBytes ||
+        bytes.length.isOdd) {
+      return Future<bool>.value(false);
+    }
+    if (_turnAudioBytes + _queuedTurnAudioBytes + bytes.length >
+        maxTurnAudioBytes) {
+      unawaited(cancelTurn());
+      _setRecoverableError(
+        'audio_limit_exceeded',
+        'That turn was too long. Please try a shorter message.',
+      );
+      return Future<bool>.value(false);
+    }
+    final payload = Uint8List.fromList(bytes);
+    final socket = _socket!;
+    final generation = _writeGeneration;
+    _queuedTurnAudioBytes += payload.length;
+    final completion = Completer<bool>();
+    _writeTail = _writeTail.then((_) async {
+      if (_disposed ||
+          generation != _writeGeneration ||
+          socket != _socket ||
+          !_turnActive) {
+        if (generation == _writeGeneration) {
+          _queuedTurnAudioBytes -= payload.length;
+        }
+        completion.complete(false);
+        return;
+      }
+      try {
+        await socket
+            .sendBinaryComplete(payload)
+            .timeout(const Duration(seconds: 2));
+        _queuedTurnAudioBytes -= payload.length;
+        _turnAudioBytes += payload.length;
+        completion.complete(true);
+      } on Object catch (error) {
+        _queuedTurnAudioBytes -= payload.length;
+        _debugLog('ordered audio send failed: ${error.runtimeType}');
+        completion.complete(false);
+        unawaited(_handleUnexpectedDisconnect(socket, _connectionGeneration));
+      }
+    });
+    return completion.future;
+  }
+
+  /// Sends end_of_turn strictly after all accepted PCM writes.
+  Future<bool> endTurnOrdered() async {
+    await _writeTail;
+    if (_disposed ||
+        !_turnActive ||
+        _state.phase != AanyaRealtimePhase.listening ||
+        _turnAudioBytes == 0 ||
+        _queuedTurnAudioBytes != 0 ||
+        _socket == null) {
+      return false;
+    }
+    try {
+      await _socket!.sendTextComplete(
+        const RealtimeEndOfTurnMessage().toWireText(),
+      );
+    } on Object catch (error) {
+      _debugLog('ordered end_of_turn send failed: ${error.runtimeType}');
+      return false;
+    }
+    _emit(
+      _state.copyWith(
+        phase: AanyaRealtimePhase.finalizing,
+        statusLabel: 'Finishing your words',
+        partialTranscript: '',
+        clearError: true,
+      ),
+    );
+    return true;
+  }
+
   bool endTurn() {
     if (_disposed ||
         !_turnActive ||
@@ -355,12 +484,12 @@ final class AanyaRealtimeClient extends ChangeNotifier {
 
   Future<bool> cancelTurn() async {
     if (_disposed || !_turnActive || _socket == null) return false;
-    try {
-      _sendControl(const RealtimeCancelTurnMessage());
-    } on Object catch (error) {
-      _debugLog('cancel_turn send failed: ${error.runtimeType}');
-    }
-    _resetTurn();
+    final socket = _socket!;
+    final connectionGeneration = _connectionGeneration;
+    final acknowledgement = Completer<bool>();
+    _cancelAcknowledgement = acknowledgement;
+    _cancellingServerTurnId = _activeServerTurnId;
+    _resetTurn(preserveCancellation: true);
     if (_state.sessionId != null) {
       _emit(
         _state.copyWith(
@@ -371,7 +500,24 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         ),
       );
     }
-    return true;
+    try {
+      socket.sendText(const RealtimeCancelTurnMessage().toWireText());
+    } on Object catch (error) {
+      _debugLog('cancel_turn send failed: ${error.runtimeType}');
+    }
+    try {
+      return await acknowledgement.future.timeout(cancelAckTimeout);
+    } on TimeoutException {
+      if (_cancelAcknowledgement == acknowledgement &&
+          !_disposed &&
+          _socket == socket &&
+          _isConnectionCurrent(connectionGeneration)) {
+        _debugLog('cancel acknowledgement timed out; recreating session');
+        _completeCancellation(false);
+        unawaited(_recoverFromCancelTimeout(socket, connectionGeneration));
+      }
+      return false;
+    }
   }
 
   void clearRecoverableError() {
@@ -390,20 +536,12 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     );
   }
 
-  /// Backgrounding closes the microphone session and suppresses reconnects.
-  /// Foregrounding starts one fresh protocol handshake.
+  /// Flutter visibility is diagnostic only. The active foreground call owns
+  /// session lifetime, so Home/shade/lock/app switching never close transport.
   Future<void> setForeground(bool isForeground) async {
     if (_disposed || _isForeground == isForeground) return;
     _isForeground = isForeground;
-    if (!isForeground) {
-      await _disconnectInternal(
-        allowFutureReconnect: true,
-        statusLabel: 'Offline',
-      );
-      return;
-    }
-    _allowReconnect = true;
-    await connect();
+    _debugLog('flutter_foreground=$isForeground socket_preserved=true');
   }
 
   Future<void> disconnect() {
@@ -418,6 +556,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     required String statusLabel,
   }) async {
     _allowReconnect = false;
+    _completeCancellation(false);
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
     final socket = _socket;
@@ -456,6 +595,10 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       return;
     }
     if (message is List<int>) {
+      if (_cancelAcknowledgement != null) {
+        _debugLog('suppressed stale binary audio during cancellation');
+        return;
+      }
       _handleBinaryMessage(socket, generation, Uint8List.fromList(message));
       return;
     }
@@ -472,14 +615,29 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       event = RealtimeServerEventParser.parse(wireText);
     } on RealtimeProtocolException catch (error) {
       _debugLog('protocol error: ${error.code}');
-      _protocolFailure(socket, generation, error.code);
+      final metadata = _receivedEventMetadata(wireText);
+      _protocolFailure(
+        socket,
+        generation,
+        error.code,
+        expectedEvent: 'valid_server_event',
+        receivedEvent: metadata.event,
+        receivedSequence: metadata.sequence,
+        turnId: metadata.turnId,
+      );
       return;
     }
 
     if (event is RealtimeSessionReadyEvent) {
       if (_state.phase != AanyaRealtimePhase.aiStarting ||
           _state.sessionId != null) {
-        _protocolFailure(socket, generation, 'duplicate_session_ready');
+        _protocolFailure(
+          socket,
+          generation,
+          'duplicate_session_ready',
+          expectedEvent: 'turn_event',
+          receivedEvent: 'session_ready',
+        );
         return;
       }
       _handshakeTimer?.cancel();
@@ -510,17 +668,37 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         ),
       );
       _eventController.add(event);
+      _timing('session_ready', generation);
       _debugLog('session ready');
       return;
     }
 
     if (_state.sessionId == null &&
         !(event is RealtimeErrorEvent && !event.recoverable)) {
-      _protocolFailure(socket, generation, 'event_before_session_ready');
+      _protocolFailure(
+        socket,
+        generation,
+        'event_before_session_ready',
+        expectedEvent: 'session_ready',
+        receivedEvent: _eventName(event),
+      );
+      return;
+    }
+    if (_cancelAcknowledgement != null &&
+        (event is RealtimeTurnEvent ||
+            (event is RealtimeErrorEvent && event.recoverable))) {
+      _handleEventDuringCancellation(socket, generation, event);
       return;
     }
     if (event is RealtimeTurnEvent && !_acceptTurnId(event.turnId)) {
-      _protocolFailure(socket, generation, 'turn_id_mismatch');
+      _protocolFailure(
+        socket,
+        generation,
+        'turn_id_mismatch',
+        expectedEvent: 'current_turn_event',
+        receivedEvent: _eventName(event),
+        turnId: event.turnId,
+      );
       return;
     }
 
@@ -565,7 +743,16 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         );
       case RealtimeTextSentenceEvent():
         if (event.sequence != _nextServerSentenceSequence) {
-          _protocolFailure(socket, generation, 'invalid_sentence_sequence');
+          _protocolFailure(
+            socket,
+            generation,
+            'invalid_sentence_sequence',
+            expectedEvent: 'text_sentence',
+            receivedEvent: 'text_sentence',
+            expectedSequence: _nextServerSentenceSequence,
+            receivedSequence: event.sequence,
+            turnId: event.turnId,
+          );
           return;
         }
         _nextServerSentenceSequence += 1;
@@ -573,11 +760,28 @@ final class AanyaRealtimeClient extends ChangeNotifier {
           _emit(_state.copyWith(responseText: event.text));
         }
       case RealtimeAudioChunkEvent():
-        if (_pendingServerAudio != null ||
-            event.sequence != _nextServerAudioSequence) {
-          _protocolFailure(socket, generation, 'invalid_audio_sequence');
+        if (_playbackSampleRateHz != null &&
+            event.audioFormat.sampleRateHz != _playbackSampleRateHz) {
+          _protocolFailure(socket, generation, 'playback_sample_rate_changed');
           return;
         }
+        if (_pendingServerAudio != null ||
+            event.sequence != _nextServerAudioSequence) {
+          _protocolFailure(
+            socket,
+            generation,
+            'invalid_audio_sequence',
+            expectedEvent: _pendingServerAudio == null
+                ? 'audio_chunk'
+                : 'binary_audio',
+            receivedEvent: 'audio_chunk',
+            expectedSequence: _nextServerAudioSequence,
+            receivedSequence: event.sequence,
+            turnId: event.turnId,
+          );
+          return;
+        }
+        _playbackSampleRateHz ??= event.audioFormat.sampleRateHz;
         _pendingServerAudio = event;
       case RealtimeSpeakingEvent():
         _emit(
@@ -588,7 +792,15 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         );
       case RealtimeTurnCompleteEvent():
         if (_pendingServerAudio != null) {
-          _protocolFailure(socket, generation, 'missing_audio_frame');
+          _protocolFailure(
+            socket,
+            generation,
+            'missing_audio_frame',
+            expectedEvent: 'binary_audio',
+            receivedEvent: 'turn_complete',
+            expectedSequence: _nextServerAudioSequence,
+            turnId: event.turnId,
+          );
           return;
         }
         _resetTurn();
@@ -634,6 +846,52 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     if (!_eventController.isClosed) _eventController.add(event);
   }
 
+  void _handleEventDuringCancellation(
+    RealtimeWebSocket socket,
+    int generation,
+    RealtimeServerEvent event,
+  ) {
+    if (event case RealtimeErrorEvent(code: 'turn_cancelled')) {
+      final expectedTurnId = _cancellingServerTurnId;
+      if (expectedTurnId != null && event.turnId != expectedTurnId) {
+        _protocolFailure(
+          socket,
+          generation,
+          'turn_id_mismatch',
+          expectedEvent: 'turn_cancelled',
+          receivedEvent: 'turn_cancelled',
+          turnId: event.turnId,
+        );
+        return;
+      }
+      final preserveRecoverableError =
+          _state.phase == AanyaRealtimePhase.error && _state.errorIsRecoverable;
+      _completeCancellation(true);
+      _resetTurn();
+      if (!preserveRecoverableError) {
+        _emit(
+          _state.copyWith(
+            phase: AanyaRealtimePhase.ready,
+            statusLabel: 'Ready',
+            partialTranscript: '',
+            clearError: true,
+          ),
+        );
+      }
+      if (!_eventController.isClosed) _eventController.add(event);
+      return;
+    }
+    final staleTurnId = switch (event) {
+      RealtimeTurnEvent(:final turnId) => turnId,
+      RealtimeErrorEvent(:final turnId) => turnId,
+      _ => null,
+    };
+    _debugLog(
+      'suppressed stale event during cancellation '
+      'received_event=${_eventName(event)} turn_id=${staleTurnId ?? 'none'}',
+    );
+  }
+
   void _handleBinaryMessage(
     RealtimeWebSocket socket,
     int generation,
@@ -644,10 +902,25 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         bytes.length != header.byteLength ||
         bytes.length > AiraRealtimeProtocol.maxFrameBytes ||
         bytes.length.isOdd) {
-      _protocolFailure(socket, generation, 'unexpected_audio_frame');
+      _protocolFailure(
+        socket,
+        generation,
+        'unexpected_audio_frame',
+        expectedEvent: header == null ? 'server_event' : 'binary_audio',
+        receivedEvent: 'binary_audio',
+        expectedSequence: header?.sequence,
+        receivedSequence: _nextServerAudioSequence,
+        turnId: header?.turnId,
+      );
       return;
     }
     _pendingServerAudio = null;
+    if (_serverAudioBytes + bytes.length >
+        AiraRealtimeProtocol.maxTurnAudioBytes) {
+      _protocolFailure(socket, generation, 'response_audio_too_large');
+      return;
+    }
+    _serverAudioBytes += bytes.length;
     _nextServerAudioSequence += 1;
     _emit(
       _state.copyWith(
@@ -683,8 +956,41 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     socket.sendText(wireText);
   }
 
-  void _protocolFailure(RealtimeWebSocket socket, int generation, String code) {
+  void _protocolFailure(
+    RealtimeWebSocket socket,
+    int generation,
+    String code, {
+    String? expectedEvent,
+    String? receivedEvent,
+    int? expectedSequence,
+    int? receivedSequence,
+    String? turnId,
+  }) {
+    final violation = RealtimeProtocolViolation(
+      code: code,
+      expectedEvent: expectedEvent,
+      receivedEvent: receivedEvent,
+      expectedSequence: expectedSequence,
+      receivedSequence: receivedSequence,
+      sessionId: _state.sessionId,
+      turnId: turnId ?? _activeServerTurnId,
+      textSequence: _nextServerSentenceSequence,
+      audioSequence: _nextServerAudioSequence,
+    );
+    _lastProtocolViolation = violation;
+    _debugLog(
+      'protocol_violation_code=${violation.code} '
+      'expected_event=${violation.expectedEvent ?? 'none'} '
+      'received_event=${violation.receivedEvent ?? 'none'} '
+      'expected_sequence=${violation.expectedSequence ?? -1} '
+      'received_sequence=${violation.receivedSequence ?? -1} '
+      'session_id=${violation.sessionId ?? 'none'} '
+      'turn_id=${violation.turnId ?? 'none'} '
+      'text_seq=${violation.textSequence} '
+      'audio_seq=${violation.audioSequence}',
+    );
     _allowReconnect = false;
+    _completeCancellation(false);
     _resetTurn();
     _emit(
       _state.copyWith(
@@ -717,6 +1023,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     int generation,
   ) async {
     if (_socket != socket || !_isConnectionCurrent(generation)) return;
+    _completeCancellation(false);
     _socket = null;
     ++_connectionGeneration;
     _handshakeTimer?.cancel();
@@ -731,20 +1038,58 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     _scheduleReconnect();
   }
 
+  Future<void> _recoverFromCancelTimeout(
+    RealtimeWebSocket socket,
+    int generation,
+  ) async {
+    if (_disposed || _socket != socket || !_isConnectionCurrent(generation)) {
+      return;
+    }
+    _socket = null;
+    ++_connectionGeneration;
+    _handshakeTimer?.cancel();
+    _handshakeTimer = null;
+    final subscription = _socketSubscription;
+    _socketSubscription = null;
+    _resetTurn();
+    _allowReconnect = true;
+    _emit(
+      _state.copyWith(
+        phase: AanyaRealtimePhase.recovering,
+        statusLabel: 'Recovering',
+        clearSession: true,
+        clearError: true,
+      ),
+    );
+    await subscription?.cancel();
+    await _safeClose(socket, 1001, 'cancel acknowledgement timeout');
+    if (!_disposed && _allowReconnect && _socket == null) {
+      await connect();
+    }
+  }
+
   void _scheduleReconnect() {
     if (_disposed ||
         !_allowReconnect ||
-        !_isForeground ||
         _socket != null ||
         _connectInFlight != null ||
         _reconnectInFlight != null) {
       return;
     }
-    if (_reconnectAttempt >= reconnectDelays.length) {
+    if (reconnectDelays.isEmpty) {
       _emitOffline('Offline');
       return;
     }
-    final delay = reconnectDelays[_reconnectAttempt];
+    if (!repeatLastReconnectDelay &&
+        _reconnectAttempt >= reconnectDelays.length) {
+      _emitOffline('Offline');
+      return;
+    }
+    final reconnectIndex = _reconnectAttempt.clamp(
+      0,
+      reconnectDelays.length - 1,
+    );
+    final delay = reconnectDelays[reconnectIndex];
     _reconnectAttempt += 1;
     _emit(
       _state.copyWith(
@@ -755,7 +1100,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     );
     final operation = () async {
       await _reconnectDelay(delay);
-      if (!_disposed && _allowReconnect && _isForeground && _socket == null) {
+      if (!_disposed && _allowReconnect && _socket == null) {
         await connect();
       }
     }();
@@ -767,7 +1112,6 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         }
         if (!_disposed &&
             _allowReconnect &&
-            _isForeground &&
             _socket == null &&
             _connectInFlight == null) {
           _scheduleReconnect();
@@ -798,13 +1142,27 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     );
   }
 
-  void _resetTurn() {
+  void _resetTurn({bool preserveCancellation = false}) {
+    _writeGeneration += 1;
     _turnActive = false;
     _turnAudioBytes = 0;
+    _queuedTurnAudioBytes = 0;
+    _serverAudioBytes = 0;
     _activeServerTurnId = null;
     _pendingServerAudio = null;
     _nextServerAudioSequence = 0;
     _nextServerSentenceSequence = 1;
+    _playbackSampleRateHz = null;
+    if (!preserveCancellation) _cancellingServerTurnId = null;
+  }
+
+  void _completeCancellation(bool acknowledged) {
+    final completion = _cancelAcknowledgement;
+    _cancelAcknowledgement = null;
+    _cancellingServerTurnId = null;
+    if (completion != null && !completion.isCompleted) {
+      completion.complete(acknowledged);
+    }
   }
 
   bool _isConnectionCurrent(int generation) =>
@@ -832,10 +1190,19 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     if (kDebugMode) debugPrint('[AIRA REALTIME] $message');
   }
 
+  void _timing(String event, int generation) {
+    _debugLog(
+      'timing event=$event session_id=${_state.sessionId ?? 'none'} '
+      'turn_id=${_activeServerTurnId ?? 'none'} generation=$generation '
+      'monotonic_us=${_monotonicClock.elapsedMicroseconds}',
+    );
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
     _allowReconnect = false;
+    _completeCancellation(false);
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
     _state = _state.copyWith(
@@ -876,3 +1243,39 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   static Future<void> _defaultReconnectDelay(Duration duration) =>
       Future<void>.delayed(duration);
 }
+
+final class _ReceivedEventMetadata {
+  const _ReceivedEventMetadata({this.event, this.sequence, this.turnId});
+
+  final String? event;
+  final int? sequence;
+  final String? turnId;
+}
+
+_ReceivedEventMetadata _receivedEventMetadata(String wireText) {
+  try {
+    final value = jsonDecode(wireText);
+    if (value is! Map) return const _ReceivedEventMetadata();
+    return _ReceivedEventMetadata(
+      event: value['type'] as String?,
+      sequence: value['sequence'] as int?,
+      turnId: value['turn_id'] as String?,
+    );
+  } on Object {
+    return const _ReceivedEventMetadata();
+  }
+}
+
+String _eventName(RealtimeServerEvent event) => switch (event) {
+  RealtimeSessionReadyEvent() => 'session_ready',
+  RealtimeSttPartialEvent() => 'stt_partial',
+  RealtimeSttFinalEvent() => 'stt_final',
+  RealtimeThinkingEvent() => 'thinking',
+  RealtimeTextDeltaEvent() => 'text_delta',
+  RealtimeTextSentenceEvent() => 'text_sentence',
+  RealtimeAudioChunkEvent() => 'audio_chunk',
+  RealtimeSpeakingEvent() => 'speaking',
+  RealtimeTurnCompleteEvent() => 'turn_complete',
+  RealtimeErrorEvent(:final recoverable) =>
+    recoverable ? 'recoverable_error' : 'fatal_error',
+};

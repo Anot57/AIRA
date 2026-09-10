@@ -237,6 +237,33 @@ class PersonaAndLlamaCommandTests(unittest.TestCase):
         self.assertIn("dependency", folded)
         self.assertIn("exclusivity", folded)
 
+    def test_ordinary_turns_forbid_unsolicited_identity_introductions(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn("never introduce yourself", persona)
+        self.assertIn("state your name", persona)
+        self.assertIn("repeat the ai disclosure", persona)
+        self.assertIn("unless the user explicitly asks", persona)
+        self.assertIn("do not begin every response with a greeting", persona)
+        self.assertIn("respond directly to the user's latest words", persona)
+
+    def test_name_question_explicitly_allows_a_truthful_aanya_answer(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn(
+            "if asked your name or who you are, you may truthfully say you are aanya",
+            persona,
+        )
+
+    def test_ai_question_requires_truthful_ai_disclosure(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn(
+            "if asked whether you are ai or human, clearly and truthfully say "
+            "you are an ai, not a human",
+            persona,
+        )
+
     def test_llama_command_is_offline_non_thinking_and_prompt_clean(self) -> None:
         llama_path = Path("/mnt/e/aira-local-runtime/llama/llama-cli")
         model_path = Path(

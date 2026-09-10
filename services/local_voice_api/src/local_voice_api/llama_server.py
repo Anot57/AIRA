@@ -108,6 +108,39 @@ class LlamaServerStreamingLanguageModel:
                     f"llama-server is not ready: {payload!r}"
                 )
 
+    def warmup_inference(self) -> None:
+        """Run one bounded synthetic completion and discard every token."""
+
+        payload = {
+            "model": "local",
+            "messages": [
+                {"role": "system", "content": self._system_persona},
+                {
+                    "role": "user",
+                    "content": "Synthetic readiness check. Reply with: ready",
+                },
+            ],
+            "max_tokens": 2,
+            "stream": True,
+        }
+        timeout = httpx.Timeout(
+            connect=self._config.connect_timeout_seconds,
+            read=30.0,
+            write=self._config.write_timeout_seconds,
+            pool=self._config.connect_timeout_seconds,
+        )
+        received = False
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            with client.stream(
+                "POST", self._config.chat_completions_url, json=payload
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if line:
+                        received = True
+        if not received:
+            raise RuntimeError("llama-server synthetic warmup returned no stream data.")
+
     async def stream(
         self,
         transcript: str,

@@ -145,6 +145,45 @@ class RealtimeLatencyMetricsTests(unittest.TestCase):
         self.assertIn("ttft_ms", str(logger.info.call_args))
         self.assertNotIn("ttfa_ms", str(logger.info.call_args))
 
+    def test_realtime_event_is_correlated_and_uses_the_injected_clock(self) -> None:
+        clock = MutableClock(12.345678)
+        metrics = RealtimeLatencyMetrics("aanya_rt_safe", clock=clock)
+        logger = mock.Mock(spec=logging.Logger)
+
+        metrics.log_event(
+            logger,
+            "stt_start",
+            session_id="session_safe",
+            generation=3,
+            input_bytes=8000,
+        )
+
+        call = logger.info.call_args
+        self.assertIn("event=%s", call.args[0])
+        self.assertEqual("stt_start", call.args[1])
+        self.assertEqual("session_safe", call.args[2])
+        self.assertEqual("aanya_rt_safe", call.args[3])
+        self.assertEqual(3, call.args[4])
+        self.assertEqual(12_345_678, call.args[5])
+        self.assertIn("input_bytes=8000", call.args[6])
+
+    def test_realtime_event_accepts_an_observed_monotonic_boundary(self) -> None:
+        metrics = RealtimeLatencyMetrics("aanya_rt_safe", clock=MutableClock(99.0))
+        logger = mock.Mock(spec=logging.Logger)
+
+        metrics.log_event(
+            logger,
+            "stt_complete",
+            session_id="session_safe",
+            generation=4,
+            monotonic_us=12_345,
+            stt_duration_ms=321.5,
+        )
+
+        call = logger.info.call_args
+        self.assertEqual(12_345, call.args[5])
+        self.assertIn("stt_duration_ms=321.5", call.args[6])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,12 @@ abstract interface class RealtimeWebSocket {
 
   void sendBinary(Uint8List bytes);
 
+  /// Completes once the frame has been accepted by the ordered socket sink.
+  Future<void> sendBinaryComplete(Uint8List bytes) async => sendBinary(bytes);
+
+  /// Completes once the control frame has been accepted by the ordered sink.
+  Future<void> sendTextComplete(String text) async => sendText(text);
+
   Future<void> close([int? code, String? reason]);
 }
 
@@ -54,6 +60,14 @@ final class _IoRealtimeWebSocket implements RealtimeWebSocket {
 
   @override
   void sendBinary(Uint8List bytes) => _socket.add(bytes);
+
+  @override
+  Future<void> sendBinaryComplete(Uint8List bytes) =>
+      _socket.addStream(Stream<Object>.value(bytes));
+
+  @override
+  Future<void> sendTextComplete(String text) =>
+      _socket.addStream(Stream<Object>.value(text));
 
   @override
   Future<void> close([int? code, String? reason]) async {

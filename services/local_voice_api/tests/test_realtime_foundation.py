@@ -375,6 +375,8 @@ class RealtimeSessionTests(unittest.TestCase):
         turn = session.finish_audio()
 
         self.assertRegex(turn.turn_id, r"\Aaanya_rt_[0-9a-f]{32}\Z")
+        self.assertEqual("session_test", turn.session_id)
+        self.assertEqual(1, turn.generation)
         self.assertEqual(MIN_SPEECH_AUDIO_BYTES, len(turn.audio))
         self.assertEqual(RealtimeSessionState.FINALIZING_STT, session.state)
         self.assertEqual(turn.turn_id, session.active_turn_id)
@@ -386,6 +388,10 @@ class RealtimeSessionTests(unittest.TestCase):
         self.assertEqual(RealtimeSessionState.LISTENING, session.state)
         self.assertIsNone(session.active_turn_id)
         self.assertEqual(0, session.buffered_audio_bytes)
+
+        session.push_audio(_meaningful_pcm())
+        second_turn = session.finish_audio()
+        self.assertEqual(2, second_turn.generation)
 
     def test_duplicate_end_of_turn_and_turn_while_busy_are_rejected(self) -> None:
         session = self._listening_session()
@@ -483,6 +489,7 @@ class RealtimeSessionTests(unittest.TestCase):
                 self.assertFalse(raised.exception.fatal)
                 self.assertEqual(RealtimeSessionState.LISTENING, session.state)
                 self.assertEqual(0, session.buffered_audio_bytes)
+                self.assertEqual(0, session.turn_generation)
 
     def test_invalid_transitions_and_non_aanya_are_never_silently_routed(self) -> None:
         session = RealtimeSession("session_test")

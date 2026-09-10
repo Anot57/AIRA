@@ -21,6 +21,7 @@ from .realtime_protocol import (
 )
 from .realtime_session import RealtimeTurn
 from .streaming import (
+    LeadingSpeakerLabelNormalizer,
     NoSpeechDetectedError,
     RealtimeInferenceUnavailableError,
     RealtimeSynthesizer,
@@ -94,22 +95,58 @@ class StreamingRealtimeTurnProcessor:
         cancel_event: threading.Event,
     ) -> None:
         _raise_if_cancelled(cancel_event)
+        self._log_timing(turn, "stt_session_start")
         transcriber_session = await self._transcriber.start_session(turn.audio_format)
+        self._log_timing(turn, "stt_session_ready")
         self._active_transcriber = transcriber_session
         sentence_sequence = 0
         audio_sequence = 0
         first_delta = True
         first_sentence = True
+        first_meaningful_text = True
         first_audio = True
         response_characters = 0
         chunker = SpeakableTextChunker(min_characters=12)
+        prefix_normalizer = LeadingSpeakerLabelNormalizer()
         try:
+            self._log_timing(
+                turn,
+                "stt_audio_push_start",
+                input_chunks=turn.input_chunk_count,
+                input_bytes=len(turn.audio),
+            )
             for offset in range(0, len(turn.audio), MAX_AUDIO_CHUNK_BYTES):
                 await transcriber_session.push_audio(
                     turn.audio[offset : offset + MAX_AUDIO_CHUNK_BYTES]
                 )
                 _raise_if_cancelled(cancel_event)
+            self._log_timing(
+                turn,
+                "stt_queue_enter",
+                input_chunks=turn.input_chunk_count,
+                input_bytes=len(turn.audio),
+            )
             transcript = await transcriber_session.finish_turn()
+            self._log_timing(
+                turn,
+                "stt_start",
+                monotonic_us=transcript.stt_start_us,
+                queue_wait_ms=transcript.stt_queue_wait_ms,
+            )
+            stt_complete_fields: dict[str, object] = {
+                "stt_duration_ms": transcript.stt_duration_ms,
+                "segment_count": transcript.segment_count,
+            }
+            if transcript.stt_no_speech_probability is not None:
+                stt_complete_fields["stt_no_speech_probability"] = (
+                    transcript.stt_no_speech_probability
+                )
+            self._log_timing(
+                turn,
+                "stt_complete",
+                monotonic_us=transcript.stt_complete_us,
+                **stt_complete_fields,
+            )
             _raise_if_cancelled(cancel_event)
             if transcript.is_final is not True:
                 raise RuntimeError("Realtime transcription did not return a final result.")
@@ -129,20 +166,18 @@ class StreamingRealtimeTurnProcessor:
             await sink.send_json(
                 server_event(ServerEventType.THINKING, turn_id=turn.turn_id)
             )
+            self._log_timing(turn, "tts_turn_start")
             await self._synthesizer.start_turn(turn.turn_id)
+            self._log_timing(turn, "tts_turn_ready")
 
-            async for delta in self._language_model.stream(normalized, cancel_event):
-                _raise_if_cancelled(cancel_event)
-                if not isinstance(delta, str):
-                    raise RuntimeError("Realtime LLM deltas must be text.")
+            async def forward_normalized_text(delta: str) -> None:
+                nonlocal audio_sequence, first_audio, first_sentence
+                nonlocal sentence_sequence, first_meaningful_text
                 if not delta:
-                    continue
-                response_characters += len(delta)
-                if response_characters > MAX_RESPONSE_TEXT_CHARACTERS:
-                    raise RuntimeError("Realtime response text exceeded its safe limit.")
-                if first_delta:
-                    turn.metrics.mark_first_llm_token()
-                    first_delta = False
+                    return
+                if first_meaningful_text:
+                    self._log_timing(turn, "first_meaningful_text")
+                    first_meaningful_text = False
                 for offset in range(0, len(delta), MAX_TEXT_DELTA_CHARACTERS):
                     await sink.send_json(
                         server_event(
@@ -154,6 +189,7 @@ class StreamingRealtimeTurnProcessor:
                 for sentence in chunker.feed(delta):
                     if first_sentence:
                         turn.metrics.mark_first_speakable_chunk()
+                        self._log_timing(turn, "first_speakable_text")
                         first_sentence = False
                     sentence_sequence += 1
                     await sink.send_json(
@@ -173,9 +209,28 @@ class StreamingRealtimeTurnProcessor:
                         first_audio,
                     )
 
+            self._log_timing(turn, "llm_request_start")
+            async for delta in self._language_model.stream(normalized, cancel_event):
+                _raise_if_cancelled(cancel_event)
+                if not isinstance(delta, str):
+                    raise RuntimeError("Realtime LLM deltas must be text.")
+                if not delta:
+                    continue
+                response_characters += len(delta)
+                if response_characters > MAX_RESPONSE_TEXT_CHARACTERS:
+                    raise RuntimeError("Realtime response text exceeded its safe limit.")
+                if first_delta:
+                    turn.metrics.mark_first_llm_token()
+                    self._log_timing(turn, "llm_first_token")
+                    first_delta = False
+                await forward_normalized_text(prefix_normalizer.feed(delta))
+
+            await forward_normalized_text(prefix_normalizer.finish())
+
             for sentence in chunker.finish():
                 if first_sentence:
                     turn.metrics.mark_first_speakable_chunk()
+                    self._log_timing(turn, "first_speakable_text")
                     first_sentence = False
                 sentence_sequence += 1
                 await sink.send_json(
@@ -196,7 +251,9 @@ class StreamingRealtimeTurnProcessor:
                 )
             if first_sentence or first_audio:
                 raise RuntimeError("Realtime response contained no speakable audio.")
+            _raise_if_cancelled(cancel_event)
             turn.metrics.mark_complete()
+            self._log_timing(turn, "turn_complete")
             turn.metrics.log(_LOGGER)
             await sink.send_json(
                 server_event(
@@ -219,6 +276,8 @@ class StreamingRealtimeTurnProcessor:
         first_audio: bool,
     ) -> tuple[int, bool]:
         _raise_if_cancelled(cancel_event)
+        if first_audio:
+            self._log_timing(turn, "tts_queue_enter")
         synthesis_started = time.perf_counter()
         previous_chunk_at = synthesis_started
         yielded_audio = False
@@ -240,6 +299,12 @@ class StreamingRealtimeTurnProcessor:
                 raise RuntimeError("Realtime synthesizer returned unsupported PCM audio.")
             if first_audio:
                 turn.metrics.mark_first_audio_sample()
+                self._log_timing(
+                    turn,
+                    "tts_first_pcm",
+                    sample_rate_hz=audio.sample_rate_hz,
+                    channels=audio.channels,
+                )
                 await sink.send_json(
                     server_event(ServerEventType.SPEAKING, turn_id=turn.turn_id)
                 )
@@ -285,12 +350,31 @@ class StreamingRealtimeTurnProcessor:
                 await sink.send_audio(pcm_frame)
                 if first_audio:
                     turn.metrics.mark_first_audio_sent()
+                    self._log_timing(
+                        turn,
+                        "first_audio_binary_sent",
+                        byte_length=len(pcm_frame),
+                    )
                     first_audio = False
                 sequence += 1
             yielded_audio = True
         if not yielded_audio:
             raise RuntimeError("Realtime synthesizer returned no audio chunks.")
         return sequence, first_audio
+
+    @staticmethod
+    def _log_timing(
+        turn: RealtimeTurn,
+        event: str,
+        **fields: object,
+    ) -> None:
+        turn.metrics.log_event(
+            _LOGGER,
+            event,
+            session_id=turn.session_id,
+            generation=turn.generation,
+            **fields,
+        )
 
     async def _synthesis_chunks(
         self, sentence: str, cancel_event: threading.Event
