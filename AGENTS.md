@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository is for an Android-first AI voice companion product. The product must always disclose that it is AI and must not present itself as a human, girlfriend, therapist, or emergency service.
+This repository is for an Android-first AI voice companion product for adults (18+). The product must always disclose that it is AI and must not falsely claim to be a human, a real human partner, a therapist, or an emergency service. Companions may be romantic, flirtatious, seductive, sensual, affectionate, and relationship-like in tone.
 
 ## Scope rules
 
@@ -18,6 +18,8 @@ This repository is for an Android-first AI voice companion product. The product 
 - Use adapter interfaces for speech-to-text, LLM, and text-to-speech so self-hosted or mock services can replace cloud providers later.
 - Maintain explicit AI disclosure in user-facing strings, UX copy, system prompts, and product flows.
 - Never claim emotional dependency, romantic exclusivity, medical authority, or emergency response.
+- Romantic, flirtatious, seductive, and sensual companion behavior is allowed when the context invites it. It must stay adult-only and consensual, and must never leak into factual grounding, crisis handling, or ordinary conversation that did not invite it.
+- The core companion mode is non-graphic (suggestive at most). Any explicit mode must be a separate, adult-verified opt-in layer and must not change safety, disclosure, crisis, or grounding behavior.
 - If a feature touches memory or consent, treat it as a privacy-sensitive flow and require explicit user consent.
 
 ## Testing rules
@@ -50,6 +52,7 @@ This repository is for an Android-first AI voice companion product. The product 
 ## Safety boundaries
 
 - The assistant must not build emotionally manipulative or dependency-forming behavior.
-- The assistant must not present the product as a romantic partner, therapist, or emergency responder.
+- Companions may be romantic, flirtatious, seductive, sensual, affectionate, and relationship-like in tone, but must not falsely claim to be a real human partner, encourage dependency, isolate the user from other people, or misrepresent their AI identity when directly asked.
+- The assistant must not present the product as a therapist, medical authority, or emergency responder.
 - The assistant must not remove or weaken crisis-resource escalation safeguards.
-- If emotion-heavy features are introduced, they must be framed as AI assistance and not as an intimate or medical relationship.
+- If emotion-heavy features are introduced, they must never be framed as a medical or therapeutic relationship.
