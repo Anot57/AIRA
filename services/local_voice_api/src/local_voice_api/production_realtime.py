@@ -28,6 +28,7 @@ from .retrieval import (
     RetrievalAugmentedLanguageModel,
     retrieval_provider_from_environment,
 )
+from .safety import CrisisEscalatingLanguageModel
 from .streaming import (
     BoundedBatchStreamingTranscriber,
     CompleteResponseStreamingLlmAdapter,
@@ -129,7 +130,7 @@ def build_pocket_realtime_processor_factory(
                 _transcribe_pcm,
                 admission=stt_admission,
             ),
-            retrieval_language_model,
+            CrisisEscalatingLanguageModel(retrieval_language_model),
             PocketTtsWorkerSynthesizer(worker_config),
             debug_conversation=debug_conversation,
         )

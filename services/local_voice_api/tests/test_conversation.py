@@ -39,6 +39,7 @@ from local_voice_api.conversation import (  # noqa: E402
     resolve_cached_llm_model,
 )
 from local_voice_api.observability import TurnTiming  # noqa: E402
+from local_voice_api.safety import CRISIS_RESOURCE_RESPONSE  # noqa: E402
 from local_voice_api.synthesis import (  # noqa: E402
     BASE_MODEL_ID as TTS_MODEL_ID,
     DEFAULT_SYNTHESIS_SEED,
@@ -604,6 +605,59 @@ class ConversationPipelineTests(ConversationRuntimeFixture):
             result.output_wav_path.is_relative_to(self.runtime_root)
         )
         self.assertTrue(result.metadata_path.is_relative_to(self.runtime_root))
+
+    def test_crisis_turn_speaks_resources_without_calling_the_llm(self) -> None:
+        raw_transcript = "I don't want to live anymore."
+
+        def fake_transcribe(**kwargs: object) -> TranscriptionResult:
+            output_dir = Path(kwargs["output_dir"])
+            output_dir.mkdir(parents=True)
+            transcript_path = output_dir / "transcript.txt"
+            metadata_path = output_dir / "transcript.json"
+            transcript_path.write_text(raw_transcript, encoding="utf-8")
+            metadata_path.write_text("{}", encoding="utf-8")
+            return TranscriptionResult(
+                transcript_path=transcript_path,
+                metadata_path=metadata_path,
+                transcript=raw_transcript,
+                detected_language="en",
+                language_probability=0.99,
+                duration=1.5,
+                segments=(TranscriptSegment(start=0.1, end=1.4, text=raw_transcript),),
+            )
+
+        def fake_synthesize(**kwargs: object) -> SynthesisResult:
+            output_dir = Path(kwargs["output_dir"])
+            output_dir.mkdir(parents=True)
+            wav_path = output_dir / "aanya_response.wav"
+            metadata_path = output_dir / "synthesis.json"
+            wav_path.write_bytes(b"not real synthesized audio")
+            metadata_path.write_text("{}", encoding="utf-8")
+            return SynthesisResult(
+                wav_path=wav_path, metadata_path=metadata_path, sample_rate=24_000
+            )
+
+        llm_runner = mock.Mock(return_value="This must never be spoken.")
+        synthesizer = mock.Mock(side_effect=fake_synthesize)
+
+        with mock.patch.dict(
+            conversation_module.os.environ, self.environment, clear=True
+        ):
+            result = conversation_module.run_conversation_turn(
+                companion_id="aanya",
+                audio_path=self.audio_path,
+                runtime_root=self.runtime_root,
+                turn_id="aanya_turn_crisis_test",
+                transcriber=mock.Mock(side_effect=fake_transcribe),
+                llm_runner=llm_runner,
+                synthesizer=synthesizer,
+            )
+
+        llm_runner.assert_not_called()
+        self.assertEqual(CRISIS_RESOURCE_RESPONSE, result.assistant_response)
+        self.assertEqual(
+            CRISIS_RESOURCE_RESPONSE, synthesizer.call_args.kwargs["text"]
+        )
 
 
 class ConversationCliTests(unittest.TestCase):

@@ -1376,12 +1376,13 @@ class RetrievalConfigurationTests(unittest.TestCase):
             {ASYNC_RETRIEVAL_ENVIRONMENT: "1"}
         )()
 
+        # The crisis-escalation wrapper stays outermost; retrieval sits inside it.
         self.assertIsInstance(
-            default_processor._language_model,
+            default_processor._language_model._language_model,
             RetrievalAugmentedLanguageModel,
         )
         self.assertIsInstance(
-            async_processor._language_model,
+            async_processor._language_model._language_model,
             AsyncRetrievalLanguageModel,
         )
 

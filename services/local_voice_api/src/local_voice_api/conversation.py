@@ -21,6 +21,7 @@ from .generation import (
     REQUIRED_E_DRIVE_ENVIRONMENT,
 )
 from .observability import TurnTiming, current_turn_timing
+from .safety import CRISIS_RESOURCE_RESPONSE, detects_crisis_signal
 from .synthesis import (
     BASE_MODEL_ID as TTS_MODEL_ID,
     DEFAULT_SYNTHESIS_SEED,
@@ -806,15 +807,18 @@ def run_conversation_turn(
 
     stage_started = time.perf_counter()
     with timing.bind(), timing.stage("llm_generation"):
-        assistant_response = run_llm(
-            normalized_transcript,
-            system_persona=persona,
-            llama_cli_path=resolved_llama_cli,
-            model_path=resolved_model,
-            cache_dir=resolved_cache,
-            timeout_seconds=llm_timeout_seconds,
-            environ=runtime_environment,
-        )
+        if detects_crisis_signal(normalized_transcript):
+            assistant_response = CRISIS_RESOURCE_RESPONSE
+        else:
+            assistant_response = run_llm(
+                normalized_transcript,
+                system_persona=persona,
+                llama_cli_path=resolved_llama_cli,
+                model_path=resolved_model,
+                cache_dir=resolved_cache,
+                timeout_seconds=llm_timeout_seconds,
+                environ=runtime_environment,
+            )
         assistant_response = validate_assistant_response(assistant_response)
     llm_duration = time.perf_counter() - stage_started
     responded_at = _utc_timestamp()
