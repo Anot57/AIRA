@@ -128,6 +128,10 @@ class _BlockingProcessor:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.finished = threading.Event()
+        # Cancel and close run later in server cleanup on the app thread, so
+        # tests must wait for them rather than read the flags immediately.
+        self.cancel_called = threading.Event()
+        self.close_called = threading.Event()
         self.cancelled = False
         self.closed = False
 
@@ -140,9 +144,11 @@ class _BlockingProcessor:
 
     async def cancel(self) -> None:
         self.cancelled = True
+        self.cancel_called.set()
 
     async def close(self) -> None:
         self.closed = True
+        self.close_called.set()
 
 
 class _CancellationRaceProcessor:
@@ -599,6 +605,8 @@ class RealtimeServerTests(unittest.TestCase):
                 self.assertEqual("turn_cancelled", websocket.receive_json()["code"])
                 websocket.send_json(_control("session_end"))
 
+        self.assertTrue(processor.cancel_called.wait(timeout=1))
+        self.assertTrue(processor.close_called.wait(timeout=1))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 
@@ -622,6 +630,8 @@ class RealtimeServerTests(unittest.TestCase):
                 self.assertTrue(processor.finished.wait(timeout=1))
                 websocket.send_json(_control("session_end"))
 
+        self.assertTrue(processor.cancel_called.wait(timeout=1))
+        self.assertTrue(processor.close_called.wait(timeout=1))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 
@@ -679,6 +689,8 @@ class RealtimeServerTests(unittest.TestCase):
                 # without cancel_turn or session_end.
 
         self.assertTrue(processor.finished.wait(timeout=1))
+        self.assertTrue(processor.cancel_called.wait(timeout=1))
+        self.assertTrue(processor.close_called.wait(timeout=1))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 
