@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import '../data/conversation_api.dart';
 import '../domain/conversation_session_turn.dart';
 import '../domain/conversation_turn_response.dart';
+import '../domain/realtime_voice_protocol.dart';
 import 'voice_io.dart';
 
 enum VoiceCallPhase {
@@ -40,7 +41,12 @@ final class VoiceCallState {
     this.callActive = false,
     this.callStartedAt,
     this.callGeneration = 0,
-  }) : turns = List<ConversationSessionTurn>.unmodifiable(turns);
+    List<RealtimeCrisisResource> crisisResources =
+        const <RealtimeCrisisResource>[],
+  }) : turns = List<ConversationSessionTurn>.unmodifiable(turns),
+       crisisResources = List<RealtimeCrisisResource>.unmodifiable(
+         crisisResources,
+       );
 
   factory VoiceCallState.initial() => VoiceCallState(
     phase: VoiceCallPhase.idle,
@@ -57,6 +63,10 @@ final class VoiceCallState {
   final bool callActive;
   final DateTime? callStartedAt;
   final int callGeneration;
+
+  /// Crisis resources the server escalated to during this call. Kept until the
+  /// user dismisses them or a new call starts, never cleared by a later turn.
+  final List<RealtimeCrisisResource> crisisResources;
 
   bool get canStartCall =>
       !callActive &&
@@ -88,6 +98,7 @@ final class VoiceCallState {
     DateTime? callStartedAt,
     int? callGeneration,
     bool clearCallStartedAt = false,
+    List<RealtimeCrisisResource>? crisisResources,
   }) {
     return VoiceCallState(
       phase: phase ?? this.phase,
@@ -100,6 +111,7 @@ final class VoiceCallState {
           ? null
           : (callStartedAt ?? this.callStartedAt),
       callGeneration: callGeneration ?? this.callGeneration,
+      crisisResources: crisisResources ?? this.crisisResources,
     );
   }
 }
@@ -118,6 +130,7 @@ abstract interface class AanyaVoiceCallCoordinator implements Listenable {
   Future<void> handleAppBackgrounded();
   void handleAppResumed();
   void clearRecoverableError();
+  void dismissCrisisResources();
   void dispose();
 }
 
@@ -583,6 +596,11 @@ final class AanyaVoiceCallController extends ChangeNotifier
         clearUserMessage: true,
       ),
     );
+  }
+
+  @override
+  void dismissCrisisResources() {
+    // The HTTP debug path never receives realtime safety escalations.
   }
 
   void _handleApiError(ConversationApiException error) {

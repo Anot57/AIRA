@@ -734,6 +734,9 @@ final class AanyaRealtimeClient extends ChangeNotifier {
             statusLabel: 'Thinking',
           ),
         );
+      case RealtimeSafetyEscalationEvent():
+        // No transport phase change; the call controller surfaces resources.
+        break;
       case RealtimeTextDeltaEvent():
         final responseText = '${_state.responseText}${event.delta}';
         if (responseText.runes.length >
@@ -1303,6 +1306,7 @@ String _eventName(RealtimeServerEvent event) => switch (event) {
   RealtimeSttPartialEvent() => 'stt_partial',
   RealtimeSttFinalEvent() => 'stt_final',
   RealtimeThinkingEvent() => 'thinking',
+  RealtimeSafetyEscalationEvent() => 'safety_escalation',
   RealtimeTextDeltaEvent() => 'text_delta',
   RealtimeTextSentenceEvent() => 'text_sentence',
   RealtimeAudioChunkEvent() => 'audio_chunk',

@@ -46,6 +46,7 @@ class ServerEventType(StrEnum):
     STT_PARTIAL = "stt_partial"
     STT_FINAL = "stt_final"
     THINKING = "thinking"
+    SAFETY_ESCALATION = "safety_escalation"
     TEXT_DELTA = "text_delta"
     TEXT_SENTENCE = "text_sentence"
     AUDIO_CHUNK = "audio_chunk"

@@ -34,6 +34,54 @@ void main() {
   });
 
   group('RealtimeServerEventParser', () {
+    Map<String, Object?> safetyEscalation() => <String, Object?>{
+      'type': 'safety_escalation',
+      'protocol_version': 1,
+      'turn_id': 'turn-1',
+      'kind': 'crisis_resources',
+      'resources': <Map<String, Object?>>[
+        <String, Object?>{'label': 'Emergency services', 'phone': '112'},
+        <String, Object?>{
+          'label': 'Tele-MANAS mental health helpline',
+          'phone': '14416',
+        },
+      ],
+    };
+
+    test('parses crisis resources from a safety escalation', () {
+      final event = RealtimeServerEventParser.parse(
+        jsonEncode(safetyEscalation()),
+      );
+
+      expect(event, isA<RealtimeSafetyEscalationEvent>());
+      final escalation = event as RealtimeSafetyEscalationEvent;
+      expect(escalation.turnId, 'turn-1');
+      expect(
+        escalation.resources.map((resource) => resource.phone),
+        <String>['112', '14416'],
+      );
+      expect(escalation.resources.first.label, 'Emergency services');
+    });
+
+    test('rejects malformed safety escalations', () {
+      final invalid = <Map<String, Object?>>[
+        <String, Object?>{...safetyEscalation(), 'kind': 'flirt'},
+        <String, Object?>{...safetyEscalation(), 'resources': <Object?>[]},
+        <String, Object?>{
+          ...safetyEscalation(),
+          'resources': <Map<String, Object?>>[
+            <String, Object?>{'label': 'Emergency', 'phone': 'call me'},
+          ],
+        },
+      ];
+      for (final payload in invalid) {
+        expect(
+          () => RealtimeServerEventParser.parse(jsonEncode(payload)),
+          _protocolError('invalid_safety_escalation'),
+        );
+      }
+    });
+
     test('parses and validates session_ready', () {
       final event = RealtimeServerEventParser.parse(
         jsonEncode(_sessionReady()),

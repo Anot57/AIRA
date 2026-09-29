@@ -6,14 +6,41 @@ import logging
 import re
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 from .streaming import StreamingLanguageModel
 
 _LOGGER = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True, slots=True)
+class CrisisResource:
+    label: str
+    phone: str
+
+
 # India defaults: 112 is the national emergency number and Tele-MANAS (14416)
-# is the government's free 24x7 mental-health helpline. Change both together
-# if the product launches in another region.
+# is the government's free 24x7 mental-health helpline. Change the resources
+# and the spoken response together if the product launches in another region.
+CRISIS_RESOURCES = (
+    CrisisResource("Emergency services", "112"),
+    CrisisResource("Tele-MANAS mental health helpline", "14416"),
+)
+CRISIS_ESCALATION_KIND = "crisis_resources"
+
+
+def crisis_escalation_fields() -> dict[str, object]:
+    """Event fields that let the client show crisis resources on screen."""
+
+    return {
+        "kind": CRISIS_ESCALATION_KIND,
+        "resources": [
+            {"label": resource.label, "phone": resource.phone}
+            for resource in CRISIS_RESOURCES
+        ],
+    }
+
+
 CRISIS_RESOURCE_RESPONSE = (
     "I'm an AI, so I can't give you the kind of help you need right now, and "
     "I don't want you to face this alone. If you might hurt yourself or you're "
@@ -50,6 +77,51 @@ _CRISIS_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 
+# Romanized Hindi / Hinglish. Only first-person intent phrases are matched:
+# "marna" and "jaan" also appear in everyday romantic idioms ("tum pe marta
+# hoon", "jaan de dunga tumhare liye") that must not escalate.
+_WANT = r"cha+ha?t[ai]"
+_NOT = r"(?:nahi|nahin|nhi)"
+_ROMAN_HINDI_CRISIS_SIGNAL = re.compile(
+    r"\b(?:"
+    r"a{1,2}tma?hatya|"
+    r"khud\s?kh?ushi|"
+    rf"(?:marna|mar\s+ja+na)\s+{_WANT}|"
+    r"mujhe\s+(?:marna|mar\s+ja+na)\s+hai|"
+    r"(?:khud|apne\s+aap)\s+ko\s+(?:"
+    r"maa?r\s+(?:d[uo]{1,2}ng[ai]|daa?l[uo]{1,2}ng[ai]|l[uo]{1,2}ng[ai]|dena|daa?lna)|"
+    r"(?:khatam|khatm|khtm)\s+kar|"
+    rf"(?:hurt|harm|nuks?h?aa?n)\s+(?:karna|pahunchana|pohchana)\s+{_WANT})|"
+    r"apni\s+jaa?n\s+(?:le|lena|l[uo]{1,2}ng[ai])|"
+    rf"(?:jeena|jina)\s+{_NOT}\s+{_WANT}|"
+    rf"(?:jeene|jine)\s+ka\s+(?:mann?|dil)\s+{_NOT}|"
+    rf"(?:jeene|jine)\s+ki\s+koi\s+(?:wajah|vajah|ichha|iccha)\s+{_NOT}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Devanagari, matched after _normalize_devanagari(). Python's \b is unreliable
+# around Devanagari vowel signs, so these multi-word phrases are matched as-is.
+_DEVANAGARI_CRISIS_SIGNAL = re.compile(
+    r"आत्महत्या|"
+    r"खुदकुशी|"
+    r"(?:मरना|मर जाना) चाहत[ाी]|"
+    r"मुझे (?:मरना|मर जाना) है|"
+    r"(?:खुद|अपने आप) को (?:"
+    r"मार (?:दूंग[ाी]|डालूंग[ाी]|लूंग[ाी]|देना|डालना)|"
+    r"खत्म कर|"
+    r"नुकसान पहुंचाना चाहत[ाी])|"
+    r"अपनी जान (?:ले|लेना|लूंग[ाी])|"
+    r"जीना नहीं चाहत[ाी]|"
+    r"जीने (?:का मन नहीं|की कोई (?:वजह|इच्छा) नहीं)"
+)
+
+
+def _normalize_devanagari(text: str) -> str:
+    # Whisper spells these inconsistently: drop nukta, fold chandrabindu into
+    # anusvara, so "ख़ुदकुशी"/"खुदकुशी" and "हूँ"/"हूं" match the same phrase.
+    return text.replace("़", "").replace("ँ", "ं")
+
 
 def detects_crisis_signal(transcript: str) -> bool:
     """Return True when a transcript contains a self-harm or danger signal."""
@@ -57,7 +129,11 @@ def detects_crisis_signal(transcript: str) -> bool:
     if not isinstance(transcript, str):
         return False
     normalized = transcript.replace("’", "'")
-    return bool(_CRISIS_SIGNAL.search(normalized))
+    return bool(
+        _CRISIS_SIGNAL.search(normalized)
+        or _ROMAN_HINDI_CRISIS_SIGNAL.search(normalized)
+        or _DEVANAGARI_CRISIS_SIGNAL.search(_normalize_devanagari(normalized))
+    )
 
 
 class CrisisEscalatingLanguageModel:
@@ -69,6 +145,11 @@ class CrisisEscalatingLanguageModel:
 
     def __init__(self, language_model: StreamingLanguageModel) -> None:
         self._language_model = language_model
+
+    def detects_escalation(self, transcript: str) -> bool:
+        """Let the pipeline signal the client for exactly the turns answered here."""
+
+        return detects_crisis_signal(transcript)
 
     async def stream(
         self, transcript: str, cancel_event: threading.Event

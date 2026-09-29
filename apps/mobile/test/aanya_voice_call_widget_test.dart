@@ -7,6 +7,7 @@ import 'package:female_voice_ai/features/call/application/aanya_voice_call_contr
 import 'package:female_voice_ai/features/call/application/voice_io.dart';
 import 'package:female_voice_ai/features/call/data/conversation_api.dart';
 import 'package:female_voice_ai/features/call/domain/conversation_turn_response.dart';
+import 'package:female_voice_ai/features/call/domain/realtime_voice_protocol.dart';
 import 'package:female_voice_ai/features/call/mock_voice_call_screen.dart';
 import 'package:female_voice_ai/features/companions/data/companion_catalog.dart';
 import 'package:female_voice_ai/features/companions/domain/companion.dart';
@@ -18,6 +19,80 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('interrupt button', () {
+    testWidgets('is hidden while listening', (tester) async {
+      final listening = _StaticCoordinator(
+        VoiceCallState.initial().copyWith(
+          phase: VoiceCallPhase.listening,
+          callActive: true,
+        ),
+      );
+      await _pumpCoordinatorScreen(tester, listening);
+
+      expect(find.byKey(const Key('aanya_interrupt_button')), findsNothing);
+    });
+
+    testWidgets('interrupts Aanya while she is speaking', (tester) async {
+      final speaking = _StaticCoordinator(
+        VoiceCallState.initial().copyWith(
+          phase: VoiceCallPhase.speaking,
+          callActive: true,
+        ),
+      );
+      await _pumpCoordinatorScreen(tester, speaking);
+      await tester.tap(find.byKey(const Key('aanya_interrupt_button')));
+      await tester.pump();
+
+      expect(speaking.cancelActiveTurnCount, 1);
+    });
+  });
+
+  group('crisis resources banner', () {
+    testWidgets('is hidden during an ordinary call', (tester) async {
+      final coordinator = _StaticCoordinator(
+        VoiceCallState.initial().copyWith(
+          phase: VoiceCallPhase.listening,
+          callActive: true,
+        ),
+      );
+      await _pumpCoordinatorScreen(tester, coordinator);
+
+      expect(find.byKey(const Key('crisis_resources_banner')), findsNothing);
+    });
+
+    testWidgets('shows escalated resources and can be dismissed', (
+      tester,
+    ) async {
+      final coordinator = _StaticCoordinator(
+        VoiceCallState.initial().copyWith(
+          phase: VoiceCallPhase.speaking,
+          callActive: true,
+          crisisResources: const <RealtimeCrisisResource>[
+            RealtimeCrisisResource(label: 'Emergency services', phone: '112'),
+            RealtimeCrisisResource(
+              label: 'Tele-MANAS mental health helpline',
+              phone: '14416',
+            ),
+          ],
+        ),
+      );
+      await _pumpCoordinatorScreen(tester, coordinator);
+
+      expect(find.byKey(const Key('crisis_resources_banner')), findsOneWidget);
+      expect(find.text('Emergency services: 112'), findsOneWidget);
+      expect(
+        find.text('Tele-MANAS mental health helpline: 14416'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Aanya is an AI'), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('crisis_resources_dismiss')));
+      await tester.pump();
+
+      expect(find.byKey(const Key('crisis_resources_banner')), findsNothing);
+    });
+  });
 
   group('Aanya voice call screen', () {
     testWidgets('shows AI disclosure and local connection state', (
@@ -250,6 +325,74 @@ void main() {
       await tester.pump();
     });
   });
+}
+
+/// A coordinator with fixed state, for testing how the screen renders it.
+final class _StaticCoordinator extends ChangeNotifier
+    implements AanyaVoiceCallCoordinator {
+  _StaticCoordinator(this._state);
+
+  VoiceCallState _state;
+
+  @override
+  VoiceCallState get state => _state;
+
+  @override
+  Future<void> get shutdownComplete => Future<void>.value();
+
+  @override
+  void dismissCrisisResources() {
+    _state = _state.copyWith(crisisResources: const <RealtimeCrisisResource>[]);
+    notifyListeners();
+  }
+
+  @override
+  Future<void> initialize() async {}
+  @override
+  Future<bool> startCall() async => false;
+  @override
+  Future<void> endCall() async {}
+  @override
+  Future<void> retryConnection() async {}
+  @override
+  Future<bool> beginRecording() async => false;
+  @override
+  Future<void> finishRecording() async {}
+  @override
+  Future<void> cancelRecording() async {}
+  int cancelActiveTurnCount = 0;
+
+  @override
+  Future<void> cancelActiveTurn() async {
+    cancelActiveTurnCount += 1;
+  }
+
+  @override
+  Future<void> handleAppBackgrounded() async {}
+  @override
+  void handleAppResumed() {}
+  @override
+  void clearRecoverableError() {}
+}
+
+Future<void> _pumpCoordinatorScreen(
+  WidgetTester tester,
+  AanyaVoiceCallCoordinator coordinator,
+) async {
+  await tester.pumpWidget(
+    DefaultAssetBundle(
+      bundle: _PortraitStubAssetBundle(),
+      child: MaterialApp(
+        theme: ThemeData(useMaterial3: true),
+        home: AanyaVoiceCallScreen(
+          companion: _aanya,
+          onEnd: () {},
+          controller: coordinator,
+        ),
+      ),
+    ),
+  );
+  await tester.pump();
 }
 
 Future<void> _pumpVoiceScreen(

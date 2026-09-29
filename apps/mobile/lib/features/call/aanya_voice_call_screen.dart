@@ -19,6 +19,7 @@ import 'data/just_audio_voice_playback.dart';
 import 'data/record_voice_recorder.dart';
 import 'data/temporary_recording_store.dart';
 import 'domain/conversation_session_turn.dart';
+import 'domain/realtime_voice_protocol.dart';
 
 typedef AanyaVoiceCallBuilder = Widget Function({
   required Companion companion,
@@ -224,6 +225,11 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
                     connection: state.connection,
                     onEnd: () => unawaited(_endCallAndExit()),
                   ),
+                  if (state.crisisResources.isNotEmpty)
+                    _CrisisResourcesBanner(
+                      resources: state.crisisResources,
+                      onDismiss: _controller.dismissCrisisResources,
+                    ),
                   Expanded(
                     child: _ConversationHistory(
                       controller: _scrollController,
@@ -239,6 +245,9 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
                       unawaited(_controller.retryConnection());
                     },
                     onClearError: _controller.clearRecoverableError,
+                    onInterrupt: () {
+                      unawaited(_controller.cancelActiveTurn());
+                    },
                   ),
                 ],
               );
@@ -385,6 +394,89 @@ class _ConnectionBadge extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CrisisResourcesBanner extends StatelessWidget {
+  const _CrisisResourcesBanner({
+    required this.resources,
+    required this.onDismiss,
+  });
+
+  final List<RealtimeCrisisResource> resources;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    return Semantics(
+      container: true,
+      liveRegion: true,
+      label: 'Crisis support resources',
+      child: Container(
+        key: const Key('crisis_resources_banner'),
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(
+          AppSpacing.md,
+          0,
+          AppSpacing.md,
+          AppSpacing.xs,
+        ),
+        padding: const EdgeInsets.all(AppSpacing.md),
+        decoration: BoxDecoration(
+          color: colors.errorContainer,
+          borderRadius: BorderRadius.circular(AppRadii.medium),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.support_rounded, color: colors.onErrorContainer),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'You deserve real support right now',
+                    style: textTheme.titleSmall?.copyWith(
+                      color: colors.onErrorContainer,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text(
+                    'Aanya is an AI and can\'t help in an emergency. '
+                    'Please reach out now:',
+                    style: textTheme.bodyMedium?.copyWith(
+                      color: colors.onErrorContainer,
+                    ),
+                  ),
+                  for (final resource in resources)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpacing.xxs),
+                      child: SelectableText(
+                        '${resource.label}: ${resource.phone}',
+                        style: textTheme.bodyLarge?.copyWith(
+                          color: colors.onErrorContainer,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            IconButton(
+              key: const Key('crisis_resources_dismiss'),
+              tooltip: 'Dismiss crisis resources',
+              onPressed: onDismiss,
+              color: colors.onErrorContainer,
+              icon: const Icon(Icons.close_rounded),
+            ),
+          ],
         ),
       ),
     );
@@ -552,6 +644,7 @@ class _VoiceControls extends StatelessWidget {
     required this.onEndCall,
     required this.onRetryConnection,
     required this.onClearError,
+    required this.onInterrupt,
   });
 
   final VoiceCallState state;
@@ -560,6 +653,7 @@ class _VoiceControls extends StatelessWidget {
   final VoidCallback onEndCall;
   final VoidCallback onRetryConnection;
   final VoidCallback onClearError;
+  final VoidCallback onInterrupt;
 
   @override
   Widget build(BuildContext context) {
@@ -669,6 +763,19 @@ class _VoiceControls extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: AppSpacing.sm),
+              if (state.phase == VoiceCallPhase.thinking ||
+                  state.phase == VoiceCallPhase.speaking) ...[
+                OutlinedButton.icon(
+                  key: const Key('aanya_interrupt_button'),
+                  onPressed: onInterrupt,
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size(190, 48),
+                  ),
+                  icon: const Icon(Icons.pan_tool_rounded),
+                  label: const Text('INTERRUPT'),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+              ],
               FilledButton.icon(
                 key: const Key('aanya_end_call_button'),
                 onPressed: state.phase == VoiceCallPhase.ending

@@ -285,6 +285,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         callStartedAt: _wallClockNow(),
         callGeneration: callGeneration,
         clearUserMessage: true,
+        crisisResources: const <RealtimeCrisisResource>[],
       ),
     );
 
@@ -987,6 +988,9 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         _userMessageCreatedAt ??= _wallClockNow();
         _logTiming('first_text_received', once: true);
         _setActivePhase(VoiceCallPhase.thinking, 'Thinking');
+      case RealtimeSafetyEscalationEvent(:final resources):
+        _logLifecycle('safety_escalation');
+        _emit(_state.copyWith(crisisResources: resources));
       case RealtimeTextDeltaEvent():
         _response = client.state.responseText;
         if (_response.trim().isNotEmpty) {
@@ -1182,6 +1186,14 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     if (_disposed) return;
     _logTiming('flutter_resumed');
     unawaited(client.setForeground(true));
+  }
+
+  @override
+  void dismissCrisisResources() {
+    if (_disposed || _state.crisisResources.isEmpty) return;
+    _emit(
+      _state.copyWith(crisisResources: const <RealtimeCrisisResource>[]),
+    );
   }
 
   @override

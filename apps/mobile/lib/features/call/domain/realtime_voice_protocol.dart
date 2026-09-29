@@ -275,6 +275,27 @@ final class RealtimeThinkingEvent extends RealtimeTurnEvent {
   });
 }
 
+/// One crisis resource the server asks the client to show on screen.
+final class RealtimeCrisisResource {
+  const RealtimeCrisisResource({required this.label, required this.phone});
+
+  final String label;
+  final String phone;
+}
+
+/// The server answered this turn with crisis resources instead of the model.
+final class RealtimeSafetyEscalationEvent extends RealtimeTurnEvent {
+  RealtimeSafetyEscalationEvent({
+    required super.protocolVersion,
+    required super.turnId,
+    required List<RealtimeCrisisResource> resources,
+  }) : resources = List<RealtimeCrisisResource>.unmodifiable(resources);
+
+  static const String crisisResourcesKind = 'crisis_resources';
+
+  final List<RealtimeCrisisResource> resources;
+}
+
 final class RealtimeTextDeltaEvent extends RealtimeTurnEvent {
   const RealtimeTextDeltaEvent({
     required super.protocolVersion,
@@ -406,6 +427,7 @@ abstract final class RealtimeServerEventParser {
         protocolVersion: protocolVersion,
         turnId: _turnId(json),
       ),
+      'safety_escalation' => _safetyEscalation(json, protocolVersion),
       'text_delta' => RealtimeTextDeltaEvent(
         protocolVersion: protocolVersion,
         turnId: _turnId(json),
@@ -522,6 +544,44 @@ abstract final class RealtimeServerEventParser {
       ),
       synthesisMs: _optionalFiniteNumber(json, 'synthesis_ms'),
       realtimeFactor: _optionalFiniteNumber(json, 'realtime_factor'),
+    );
+  }
+
+  static RealtimeSafetyEscalationEvent _safetyEscalation(
+    Map<String, Object?> json,
+    int protocolVersion,
+  ) {
+    const invalid = RealtimeProtocolException(
+      'invalid_safety_escalation',
+      'The realtime service sent an invalid safety escalation.',
+    );
+    final kind = _requiredString(json, 'kind', maxLength: 32);
+    if (kind != RealtimeSafetyEscalationEvent.crisisResourcesKind) {
+      throw invalid;
+    }
+    final rawResources = json['resources'];
+    if (rawResources is! List<Object?> ||
+        rawResources.isEmpty ||
+        rawResources.length > 4) {
+      throw invalid;
+    }
+    final phonePattern = RegExp(r'^\+?[0-9][0-9 -]{1,18}$');
+    final resources = <RealtimeCrisisResource>[];
+    for (final rawResource in rawResources) {
+      final resource = _asObject(rawResource, 'resource');
+      final phone = _requiredString(resource, 'phone', maxLength: 20);
+      if (!phonePattern.hasMatch(phone)) throw invalid;
+      resources.add(
+        RealtimeCrisisResource(
+          label: _requiredString(resource, 'label', maxLength: 80),
+          phone: phone,
+        ),
+      );
+    }
+    return RealtimeSafetyEscalationEvent(
+      protocolVersion: protocolVersion,
+      turnId: _turnId(json),
+      resources: resources,
     );
   }
 

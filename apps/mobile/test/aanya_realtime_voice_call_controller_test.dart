@@ -598,6 +598,84 @@ void main() {
     await harness.endpointUserSpeech();
   });
 
+  test('interrupting while Aanya speaks stops her and resumes listening', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'Tell me a story'))
+      ..sendJson(_turn('text_delta', delta: 'Once upon a time.'))
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[1, 0, 2, 0]);
+    await _flush();
+    expect(harness.controller.state.phase, VoiceCallPhase.speaking);
+    final stopsBefore = harness.playback.stopCount;
+
+    final interruption = harness.controller.cancelActiveTurn();
+    await _flush();
+    expect(_sentTypes(harness.socket), contains('cancel_turn'));
+    expect(harness.playback.stopCount, greaterThan(stopsBefore));
+
+    // Late output from the interrupted turn must never be played.
+    final appendsBefore = harness.playback.appended.length;
+    harness.socket
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[3, 0, 4, 0])
+      ..sendJson(_cancelled(turnId: 'turn-1'));
+    await interruption;
+    await _flush();
+
+    expect(harness.playback.appended.length, appendsBefore);
+    expect(harness.socket.closeCount, 0);
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+    expect(harness.recorder.startCount, 2);
+  });
+
+  test('crisis escalation stays visible until dismissed or a new call', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    expect(harness.controller.state.crisisResources, isEmpty);
+
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'main apni jaan le lunga'))
+      ..sendJson(_safetyEscalation());
+    await _flush();
+
+    final resources = harness.controller.state.crisisResources;
+    expect(resources.map((resource) => resource.phone), <String>['112', '14416']);
+
+    harness.completeServerTurn('turn-1');
+    await _flush(12);
+    expect(harness.controller.state.crisisResources, hasLength(2));
+
+    harness.controller.dismissCrisisResources();
+    expect(harness.controller.state.crisisResources, isEmpty);
+  });
+
+  test('a new call never inherits the previous call crisis banner', () async {
+    final harness = _Harness(extraSockets: 1);
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'I want to die'))
+      ..sendJson(_safetyEscalation());
+    await _flush();
+    expect(harness.controller.state.crisisResources, isNotEmpty);
+
+    await harness.controller.endCall();
+    await harness.controller.startCall();
+    await _flush();
+
+    expect(harness.controller.state.crisisResources, isEmpty);
+  });
+
   test('Back cleanup remains bounded when platform resources hang', () async {
     final harness = _Harness(
       resourceShutdownTimeout: const Duration(milliseconds: 10),
@@ -998,6 +1076,19 @@ Map<String, Object?> _sessionReady({
     'channels': 1,
   },
 };
+
+Map<String, Object?> _safetyEscalation({String turnId = 'turn-1'}) =>
+    <String, Object?>{
+      ..._turn('safety_escalation', turnId: turnId),
+      'kind': 'crisis_resources',
+      'resources': <Map<String, Object?>>[
+        <String, Object?>{'label': 'Emergency services', 'phone': '112'},
+        <String, Object?>{
+          'label': 'Tele-MANAS mental health helpline',
+          'phone': '14416',
+        },
+      ],
+    };
 
 Map<String, Object?> _turn(
   String type, {

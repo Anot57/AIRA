@@ -24,6 +24,7 @@ from .realtime_protocol import (
     server_event,
 )
 from .realtime_session import RealtimeTurn
+from .safety import crisis_escalation_fields
 from .streaming import (
     LeadingSpeakerLabelNormalizer,
     NoSpeechDetectedError,
@@ -279,6 +280,17 @@ class StreamingRealtimeTurnProcessor:
                     text=normalized,
                 )
             )
+            detects_escalation = getattr(
+                self._language_model, "detects_escalation", None
+            )
+            if detects_escalation is not None and detects_escalation(normalized):
+                await sink.send_json(
+                    server_event(
+                        ServerEventType.SAFETY_ESCALATION,
+                        turn_id=turn.turn_id,
+                        **crisis_escalation_fields(),
+                    )
+                )
             await sink.send_json(
                 server_event(ServerEventType.THINKING, turn_id=turn.turn_id)
             )
