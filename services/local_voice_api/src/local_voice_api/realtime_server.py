@@ -27,10 +27,15 @@ from .realtime_protocol import (
     server_event,
 )
 from .realtime_session import RealtimeSession, RealtimeSessionState, RealtimeTurn
-from .streaming import NoSpeechDetectedError, RealtimeInferenceUnavailableError
+from .streaming import (
+    NoSpeechDetectedError,
+    RealtimeInferenceUnavailableError,
+    RealtimeSttTimeoutError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _CANCEL_CLEANUP_TIMEOUT_SECONDS = 0.25
+_PROCESSOR_CLOSE_TIMEOUT_SECONDS = 0.5
 
 
 def _monotonic_us() -> int:
@@ -210,6 +215,32 @@ class RealtimeWebSocketHandler:
                         ),
                     }
                 )
+
+        if self._inference_available and readiness.get("status") == "ready":
+            try:
+                prepare = getattr(self._processor, "prepare", None)
+                if prepare is not None:
+                    await prepare()
+                    self._log_session_timing("processor_prepared")
+            except Exception:
+                raw_components = readiness.get("components")
+                components = (
+                    dict(raw_components)
+                    if isinstance(raw_components, Mapping)
+                    else {}
+                )
+                if "llm" in components:
+                    components["llm"] = "degraded"
+                readiness.update(
+                    {
+                        "status": "degraded",
+                        "components": components,
+                        "message": (
+                            "The persistent local inference connection is unavailable."
+                        ),
+                    }
+                )
+
         can_process_turns = (
             self._inference_available and readiness.get("status") == "ready"
         )
@@ -351,6 +382,14 @@ class RealtimeWebSocketHandler:
                 )
             )
             self._recover_if_open()
+        except RealtimeSttTimeoutError:
+            await self._send_error(
+                ProtocolError(
+                    "stt_timeout",
+                    "Speech recognition timed out. Please try speaking again.",
+                )
+            )
+            self._recover_if_open()
         except RealtimeInferenceUnavailableError:
             await self._send_error(
                 ProtocolError(
@@ -422,6 +461,7 @@ class RealtimeWebSocketHandler:
             self._session.recover_turn()
 
     async def _cleanup(self) -> None:
+        self._log_session_timing("cleanup_started")
         task = self._turn_task
         if task is not None and not task.done():
             try:
@@ -434,24 +474,43 @@ class RealtimeWebSocketHandler:
                     self._session.cancel_turn()
                 else:
                     self._session.cancel_requested.set()
-                await self._processor.cancel()
+                task.cancel()
+                cancel_task = asyncio.create_task(self._processor.cancel())
+                done, pending = await asyncio.wait(
+                    {task, cancel_task},
+                    timeout=_CANCEL_CLEANUP_TIMEOUT_SECONDS,
+                )
+                for pending_task in pending:
+                    pending_task.cancel()
+                for completed in done:
+                    try:
+                        completed.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        _LOGGER.debug(
+                            "Realtime cleanup task failed.", exc_info=True
+                        )
+                if pending:
+                    _LOGGER.warning(
+                        "Realtime disconnect cleanup timed out session_id=%s",
+                        self._session.session_id,
+                    )
             except Exception:
                 _LOGGER.exception(
                     "Realtime processor cancellation failed session_id=%s",
                     self._session.session_id,
                 )
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    _LOGGER.debug(
-                        "Realtime task failed during cleanup.", exc_info=True
-                    )
         try:
-            await self._processor.close()
+            await asyncio.wait_for(
+                self._processor.close(),
+                timeout=_PROCESSOR_CLOSE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            _LOGGER.warning(
+                "Realtime processor close timed out session_id=%s",
+                self._session.session_id,
+            )
         except Exception:
             _LOGGER.exception(
                 "Realtime processor close failed session_id=%s",
@@ -459,6 +518,7 @@ class RealtimeWebSocketHandler:
             )
         finally:
             self._session.close()
+            self._log_session_timing("cleanup_complete")
 
     async def _send_error(self, error: ProtocolError) -> None:
         try:

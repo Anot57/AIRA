@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -16,6 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 _CURRENT_TIMING: ContextVar[TurnTiming | None] = ContextVar(
     "aira_current_turn_timing", default=None
 )
+DEBUG_CONVERSATION_ENVIRONMENT = "AIRA_DEBUG_CONVERSATION"
 
 
 def _milliseconds(seconds: float) -> float:
@@ -148,11 +150,30 @@ class RealtimeLatencyMetrics:
         self._clock = clock
         self._end_of_turn_at: float | None = None
         self._milestones: dict[str, float] = {}
+        self._boundaries: dict[str, float] = {}
 
     def start_end_of_turn(self) -> None:
         if self._end_of_turn_at is not None:
             raise RuntimeError("End-of-turn timing has already started.")
         self._end_of_turn_at = self._clock()
+        self._boundaries["end_of_turn_received"] = self._end_of_turn_at
+        self._boundaries["speech_end"] = self._end_of_turn_at
+
+    def mark_boundary(self, name: str, *, monotonic_us: int | None = None) -> None:
+        """Record an exact same-process boundary once for stage calculations."""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Boundary names must be non-empty strings.")
+        if monotonic_us is not None and (
+            isinstance(monotonic_us, bool)
+            or not isinstance(monotonic_us, int)
+            or monotonic_us < 0
+        ):
+            raise ValueError("monotonic_us must be a non-negative integer")
+        self._boundaries.setdefault(
+            name,
+            self._clock() if monotonic_us is None else monotonic_us / 1_000_000,
+        )
 
     def mark_stt_final(self) -> None:
         self._mark_once("stt_final_ms")
@@ -184,7 +205,61 @@ class RealtimeLatencyMetrics:
         return elapsed
 
     def snapshot(self) -> dict[str, float]:
-        return dict(self._milestones)
+        return {**self._milestones, **self.stage_breakdown()}
+
+    def boundary_monotonic_us(self, name: str) -> int | None:
+        """Return an existing boundary without recording another clock read."""
+
+        boundary = self._boundaries.get(name)
+        return round(boundary * 1_000_000) if boundary is not None else None
+
+    def stage_breakdown(self) -> dict[str, float]:
+        pairs = {
+            "end_of_turn_to_stt_start_ms": (
+                "end_of_turn_received",
+                "stt_start",
+            ),
+            "stt_ms": ("stt_start", "stt_complete"),
+            "stt_to_llm_start_ms": ("stt_complete", "llm_request_start"),
+            "llm_ttft_ms": ("llm_request_start", "llm_first_token"),
+            "meaningful_text_ms": (
+                "llm_request_start",
+                "first_meaningful_text",
+            ),
+            "tts_to_first_pcm_ms": ("tts_queue_enter", "tts_first_pcm"),
+            "first_pcm_to_binary_sent_ms": (
+                "tts_first_pcm",
+                "first_audio_binary_sent",
+            ),
+            "stt_to_reaction_selected_ms": (
+                "stt_complete",
+                "reaction_selected",
+            ),
+            "reaction_selected_to_tts_start_ms": (
+                "reaction_selected",
+                "reaction_tts_start",
+            ),
+            "reaction_tts_to_first_audio_ms": (
+                "reaction_tts_start",
+                "first_audio",
+            ),
+            "retrieval_ms": ("retrieval_start", "retrieval_complete"),
+            "retrieval_to_grounded_llm_ms": (
+                "retrieval_complete",
+                "grounded_llm_start",
+            ),
+            "grounded_llm_ttft_ms": (
+                "grounded_llm_start",
+                "grounded_first_token",
+            ),
+        }
+        measured: dict[str, float] = {}
+        for label, (start, end) in pairs.items():
+            if start in self._boundaries and end in self._boundaries:
+                measured[label] = _milliseconds(
+                    self._boundaries[end] - self._boundaries[start]
+                )
+        return measured
 
     def log_event(
         self,
@@ -240,3 +315,271 @@ class RealtimeLatencyMetrics:
             f"{key}={value:.3f}" for key, value in sorted(self._milestones.items())
         )
         logger.info("[AIRA TTFA] turn_id=%s %s", self.turn_id, fields)
+
+
+def debug_conversation_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environ is None else environ
+    return source.get(DEBUG_CONVERSATION_ENVIRONMENT, "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+class RealtimeConversationDebugTurn:
+    """Opt-in local terminal view over one realtime turn's existing metrics."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        generation: int,
+        metrics: RealtimeLatencyMetrics,
+        logger: logging.Logger,
+    ) -> None:
+        self.session_id = session_id
+        self.turn_id = turn_id
+        self.generation = generation
+        self.metrics = metrics
+        self._logger = logger
+        self._response_parts: list[str] = []
+        self._mode = "none"
+        self._retrieval_status = "not_applicable"
+        self._retrieval_ms: float | None = None
+        self._retrieval_completed_us: int | None = None
+        self._turn_status = "active"
+        self._aanya_logged = False
+        self._summary_logged = False
+
+    def log_user(self, transcript: str) -> None:
+        self._logger.info(
+            "[AIRA CONVERSATION] session_id=%s turn_id=%s\nUSER: %s",
+            _safe_field(self.session_id),
+            _safe_field(self.turn_id),
+            _conversation_line(transcript),
+        )
+
+    def add_response_text(self, delta: str) -> None:
+        if delta:
+            self._response_parts.append(delta)
+
+    def set_retrieval_mode(self, mode: str) -> None:
+        self._mode = _safe_mode(mode)
+        if self._mode == "none":
+            self._retrieval_status = "not_applicable"
+        elif self._retrieval_status == "not_applicable":
+            self._retrieval_status = "pending"
+
+    def retrieval_started(self, mode: str) -> None:
+        self.set_retrieval_mode(mode)
+        self._retrieval_status = "pending"
+
+    def retrieval_finished(
+        self,
+        *,
+        status: str,
+        elapsed_ms: float,
+        completed_us: int,
+    ) -> None:
+        self._retrieval_status = _safe_status(status)
+        self._retrieval_ms = round(max(0.0, elapsed_ms), 3)
+        self._retrieval_completed_us = completed_us
+        self._log_summary_if_ready()
+
+    def completed(self) -> None:
+        if self._turn_status != "active":
+            return
+        self._turn_status = "completed"
+        self._log_aanya_once()
+        self._log_summary_if_ready()
+
+    def cancelled(self) -> None:
+        self._finish_early("cancelled")
+
+    def failed(self) -> None:
+        self._finish_early("failed")
+
+    def _finish_early(self, status: str) -> None:
+        if self._turn_status != "active":
+            return
+        self._turn_status = status
+        self._log_summary()
+
+    def _log_aanya_once(self) -> None:
+        if self._aanya_logged:
+            return
+        response = _conversation_line("".join(self._response_parts))
+        if response:
+            self._logger.info(
+                "[AIRA CONVERSATION] session_id=%s turn_id=%s\nAANYA: %s",
+                _safe_field(self.session_id),
+                _safe_field(self.turn_id),
+                response,
+            )
+        self._aanya_logged = True
+
+    def _log_summary_if_ready(self) -> None:
+        if self._turn_status != "completed":
+            return
+        if self._mode != "none" and self._retrieval_status == "pending":
+            return
+        self._log_summary()
+
+    def _log_summary(self) -> None:
+        if self._summary_logged:
+            return
+        values = self.metrics.snapshot()
+        first_audio_us = self.metrics.boundary_monotonic_us(
+            "first_audio_binary_sent"
+        )
+        retrieval_before_audio: str
+        if self._retrieval_completed_us is None or first_audio_us is None:
+            retrieval_before_audio = "not_available"
+        else:
+            retrieval_before_audio = str(
+                self._retrieval_completed_us <= first_audio_us
+            ).lower()
+
+        lines = [
+            "[AIRA TURN SUMMARY] "
+            f"session_id={_safe_field(self.session_id)} "
+            f"turn_id={_safe_field(self.turn_id)}",
+            f"status={self._turn_status}",
+            f"mode={self._mode}",
+            f"stt_ms={_metric(values, 'stt_ms')}",
+            f"llm_first_token_ms={_metric(values, 'llm_ttft_ms')}",
+            f"first_speakable_ms={_metric(values, 'ttfs_ms')}",
+            f"tts_first_pcm_ms={_metric(values, 'tts_to_first_pcm_ms')}",
+            f"ttfa_ms={_metric(values, 'ttfa_ms')}",
+            f"response_start_ms={_metric(values, 'ttfa_ms')}",
+            f"retrieval_status={self._retrieval_status}",
+            "retrieval_ms="
+            f"{_format_ms(self._retrieval_ms)}",
+            "retrieval_finished_before_first_audio="
+            f"{retrieval_before_audio}",
+        ]
+        self._logger.info("\n".join(lines))
+        self._summary_logged = True
+
+
+_CURRENT_REALTIME_DEBUG_TURN: ContextVar[
+    RealtimeConversationDebugTurn | None
+] = ContextVar("aira_current_realtime_debug_turn", default=None)
+_CURRENT_REALTIME_METRICS: ContextVar[
+    RealtimeLatencyMetrics | None
+] = ContextVar("aira_current_realtime_metrics", default=None)
+
+
+class RealtimeConversationMonitor:
+    def __init__(
+        self,
+        enabled: bool,
+        *,
+        logger: logging.Logger = _LOGGER,
+    ) -> None:
+        self._enabled = enabled
+        self._logger = logger
+
+    @contextmanager
+    def turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        generation: int,
+        metrics: RealtimeLatencyMetrics,
+    ) -> Iterator[RealtimeConversationDebugTurn | None]:
+        debug_turn = (
+            RealtimeConversationDebugTurn(
+                session_id=session_id,
+                turn_id=turn_id,
+                generation=generation,
+                metrics=metrics,
+                logger=self._logger,
+            )
+            if self._enabled
+            else None
+        )
+        metrics_token = _CURRENT_REALTIME_METRICS.set(metrics)
+        debug_token = _CURRENT_REALTIME_DEBUG_TURN.set(debug_turn)
+        try:
+            yield debug_turn
+        finally:
+            _CURRENT_REALTIME_DEBUG_TURN.reset(debug_token)
+            _CURRENT_REALTIME_METRICS.reset(metrics_token)
+
+
+def current_realtime_debug_turn() -> RealtimeConversationDebugTurn | None:
+    return _CURRENT_REALTIME_DEBUG_TURN.get()
+
+
+def mark_current_realtime_boundary(name: str) -> None:
+    metrics = _CURRENT_REALTIME_METRICS.get()
+    if metrics is not None:
+        metrics.mark_boundary(name)
+
+
+def debug_retrieval_mode(mode: str) -> None:
+    turn = current_realtime_debug_turn()
+    if turn is not None:
+        turn.set_retrieval_mode(mode)
+
+
+def debug_retrieval_started(mode: str) -> None:
+    mark_current_realtime_boundary("retrieval_start")
+    turn = current_realtime_debug_turn()
+    if turn is not None:
+        turn.retrieval_started(mode)
+
+
+def debug_retrieval_finished(
+    *,
+    status: str,
+    elapsed_ms: float,
+    completed_us: int,
+) -> None:
+    metrics = _CURRENT_REALTIME_METRICS.get()
+    if metrics is not None:
+        metrics.mark_boundary(
+            "retrieval_complete",
+            monotonic_us=completed_us,
+        )
+    turn = current_realtime_debug_turn()
+    if turn is not None:
+        turn.retrieval_finished(
+            status=status,
+            elapsed_ms=elapsed_ms,
+            completed_us=completed_us,
+        )
+
+
+def _conversation_line(value: str) -> str:
+    return " ".join(value.split()).strip()
+
+
+def _safe_mode(mode: str) -> str:
+    return mode if mode in {
+        "none",
+        "background_only",
+        "current_turn_required",
+    } else "unknown"
+
+
+def _safe_status(status: str) -> str:
+    return status if status in {
+        "complete",
+        "failure",
+        "cancelled",
+    } else "unknown"
+
+
+def _format_ms(value: float | None) -> str:
+    return "not_available" if value is None else f"{value:.3f}"
+
+
+def _metric(values: Mapping[str, float], name: str) -> str:
+    return _format_ms(values.get(name))

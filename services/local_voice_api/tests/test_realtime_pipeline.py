@@ -25,11 +25,16 @@ from local_voice_api.realtime_session import (  # noqa: E402
     MIN_SPEECH_AUDIO_BYTES,
     RealtimeSession,
 )
+from local_voice_api.retrieval import (  # noqa: E402
+    AsyncRetrievalLanguageModel,
+    RetrievalResult,
+)
 from local_voice_api.streaming import (  # noqa: E402
     BoundedBatchStreamingTranscriber,
     FinalTranscriptionResult,
     LeadingSpeakerLabelNormalizer,
     NoSpeechDetectedError,
+    RealtimeSttTimeoutError,
     SpeakableTextChunker,
     StreamingTranscript,
     SynthesizedAudioChunk,
@@ -45,6 +50,14 @@ def _turn():
         struct.pack("<h", 1000) * (MIN_SPEECH_AUDIO_BYTES // 2)
     )
     return session.finish_audio()
+
+
+def _sentence_texts(sink) -> list[str]:
+    return [
+        str(event["text"])
+        for event in sink.events
+        if event["type"] == "text_sentence"
+    ]
 
 
 class _Sink:
@@ -90,6 +103,23 @@ class _Transcriber:
         return self.session
 
 
+class _LikelyNoiseTranscriberSession(_TranscriberSession):
+    async def finish_turn(self) -> StreamingTranscript:
+        return StreamingTranscript(
+            "Thank you.",
+            is_final=True,
+            stt_no_speech_probability=0.91,
+        )
+
+
+class _CurrentNewsTranscriberSession(_TranscriberSession):
+    async def finish_turn(self) -> StreamingTranscript:
+        return StreamingTranscript(
+            "What happened in Nepal today?",
+            is_final=True,
+        )
+
+
 class _LanguageModel:
     async def stream(
         self, transcript: str, cancel_event: threading.Event
@@ -115,10 +145,68 @@ class _MutableLanguageModel:
             yield delta
 
 
+class _AsyncRetrievalLanguageModel:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def stream(
+        self, transcript: str, cancel_event: threading.Event
+    ):
+        self.prompts.append(transcript)
+        if cancel_event.is_set():
+            return
+        yield "The verified story is here."
+
+
+class _BlockingRetrievalProvider:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.completed = asyncio.Event()
+        self.cancelled = False
+
+    async def search(self, query: str, *, medical: bool, limit: int):
+        del query, medical, limit
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.completed.set()
+        return (
+            RetrievalResult(
+                "Trusted report",
+                "https://example.com/report",
+                "Verified current details.",
+            ),
+        )
+
+
 class _FreshTranscriber:
     async def start_session(self, audio_format: PcmAudioFormat):
         del audio_format
         return _TranscriberSession()
+
+
+class _HangingTranscriberSession(_TranscriberSession):
+    async def finish_turn(self) -> StreamingTranscript:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class _FailingTranscriberSession(_TranscriberSession):
+    async def finish_turn(self) -> StreamingTranscript:
+        raise RuntimeError("deterministic STT failure")
+
+
+class _SequenceTranscriber:
+    def __init__(self, sessions: list[_TranscriberSession]) -> None:
+        self.sessions = sessions
+
+    async def start_session(self, audio_format: PcmAudioFormat):
+        del audio_format
+        return self.sessions.pop(0)
 
 
 class _Synthesizer:
@@ -204,6 +292,73 @@ class _GatedStreamingSynthesizer(_StreamingSynthesizer):
 
 
 class StreamingPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stt_timeout_is_terminal_and_next_turn_remains_usable(self) -> None:
+        transcriber = _SequenceTranscriber(
+            [_HangingTranscriberSession(), _TranscriberSession()]
+        )
+        processor = StreamingRealtimeTurnProcessor(
+            transcriber,
+            _LanguageModel(),
+            _SmallSynthesizer(),
+            stt_timeout_seconds=0.01,
+        )
+
+        with self.assertLogs(
+            "local_voice_api.realtime_pipeline", level=logging.INFO
+        ) as captured:
+            with self.assertRaises(RealtimeSttTimeoutError):
+                await processor.process_turn(_turn(), _Sink(), threading.Event())
+
+        terminal = [line for line in captured.output if "event=stt_terminal" in line]
+        self.assertEqual(1, len(terminal))
+        self.assertIn("status=timeout", terminal[0])
+
+        sink = _Sink()
+        await processor.process_turn(_turn(), sink, threading.Event())
+        self.assertEqual("turn_complete", sink.events[-1]["type"])
+        await processor.close()
+
+    async def test_stt_error_is_terminal_and_next_turn_remains_usable(self) -> None:
+        transcriber = _SequenceTranscriber(
+            [_FailingTranscriberSession(), _TranscriberSession()]
+        )
+        processor = StreamingRealtimeTurnProcessor(
+            transcriber,
+            _LanguageModel(),
+            _SmallSynthesizer(),
+        )
+
+        with self.assertLogs(
+            "local_voice_api.realtime_pipeline", level=logging.INFO
+        ) as captured:
+            with self.assertRaisesRegex(RuntimeError, "STT failure"):
+                await processor.process_turn(_turn(), _Sink(), threading.Event())
+
+        terminal = [line for line in captured.output if "event=stt_terminal" in line]
+        self.assertEqual(1, len(terminal))
+        self.assertIn("status=error", terminal[0])
+
+        sink = _Sink()
+        await processor.process_turn(_turn(), sink, threading.Event())
+        self.assertEqual("turn_complete", sink.events[-1]["type"])
+        await processor.close()
+
+    async def test_likely_whisper_noise_never_reaches_llm_or_tts(self) -> None:
+        language_model = _LanguageModel()
+        synthesizer = _SmallSynthesizer()
+        processor = StreamingRealtimeTurnProcessor(
+            _Transcriber(_LikelyNoiseTranscriberSession()),
+            language_model,
+            synthesizer,
+        )
+        turn = _turn()
+
+        with self.assertRaises(NoSpeechDetectedError):
+            await processor.process_turn(turn, _Sink(), turn.cancel_event)
+
+        self.assertFalse(hasattr(language_model, "transcript"))
+        self.assertIsNone(synthesizer.started_turn)
+
     async def test_latency_boundaries_are_correlated_and_content_free(self) -> None:
         processor = StreamingRealtimeTurnProcessor(
             _Transcriber(), _LanguageModel(), _SmallSynthesizer()
@@ -235,6 +390,33 @@ class StreamingPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Hello Anna", logs)
         self.assertNotIn("Hello there", logs)
         self.assertNotIn("AI companion", logs)
+
+    async def test_debug_conversation_logs_final_text_and_turn_summary(
+        self,
+    ) -> None:
+        processor = StreamingRealtimeTurnProcessor(
+            _Transcriber(),
+            _LanguageModel(),
+            _SmallSynthesizer(),
+            debug_conversation=True,
+        )
+        turn = _turn()
+
+        with self.assertLogs(
+            "local_voice_api.realtime_pipeline", level=logging.INFO
+        ) as captured:
+            await processor.process_turn(turn, _Sink(), turn.cancel_event)
+
+        logs = "\n".join(captured.output)
+        self.assertIn("USER: Hello Aanya", logs)
+        self.assertIn(
+            "AANYA: Hello there. I am an AI companion.",
+            logs,
+        )
+        self.assertIn("[AIRA TURN SUMMARY]", logs)
+        self.assertIn("status=completed", logs)
+        self.assertIn("mode=none", logs)
+        self.assertRegex(logs, r"response_start_ms=\d+\.\d{3}")
 
     async def test_twenty_sequential_turns_share_one_normalized_text_stream(
         self,
@@ -290,6 +472,100 @@ class StreamingPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(processing.done())
         synthesizer.release.set()
         await processing
+
+    async def test_async_retrieval_first_audio_precedes_retrieval_completion(
+        self,
+    ) -> None:
+        provider = _BlockingRetrievalProvider()
+        local_model = _AsyncRetrievalLanguageModel()
+        retrieval_model = AsyncRetrievalLanguageModel(local_model, provider)
+        processor = StreamingRealtimeTurnProcessor(
+            _Transcriber(_CurrentNewsTranscriberSession()),
+            retrieval_model,
+            _SmallSynthesizer(),
+        )
+        turn = _turn()
+        sink = _Sink()
+
+        with self.assertLogs(level=logging.INFO) as captured:
+            processing = asyncio.create_task(
+                processor.process_turn(turn, sink, turn.cancel_event)
+            )
+            await asyncio.wait_for(provider.started.wait(), timeout=1)
+            await asyncio.wait_for(sink.first_audio_sent.wait(), timeout=1)
+
+            self.assertFalse(provider.completed.is_set())
+            self.assertFalse(processing.done())
+            reaction = _sentence_texts(sink)[0]
+            self.assertLessEqual(len(reaction.rstrip(".!?").split()), 5)
+            self.assertEqual([], local_model.prompts)
+
+            provider.release.set()
+            await asyncio.wait_for(processing, timeout=1)
+
+        logs = "\n".join(captured.output)
+        first_audio_index = logs.index("event=first_audio_binary_sent")
+        retrieval_complete_index = logs.index(
+            "[AIRA RETRIEVAL ASYNC] event=complete"
+        )
+        self.assertLess(first_audio_index, retrieval_complete_index)
+        self.assertIn("event=reaction_selected", logs)
+        self.assertIn("event=reaction_tts_start", logs)
+        self.assertIn("event=grounded_llm_start", logs)
+        self.assertIn("event=grounded_first_token", logs)
+        self.assertEqual(
+            [reaction, "The verified story is here."],
+            _sentence_texts(sink),
+        )
+        self.assertIn("<refs>", local_model.prompts[-1])
+        metrics = turn.metrics.snapshot()
+        self.assertIn("stt_to_reaction_selected_ms", metrics)
+        self.assertIn("reaction_selected_to_tts_start_ms", metrics)
+        self.assertIn("reaction_tts_to_first_audio_ms", metrics)
+        self.assertIn("retrieval_ms", metrics)
+        self.assertIn("grounded_llm_ttft_ms", metrics)
+        await processor.close()
+
+    async def test_async_retrieval_cancellation_suppresses_continuation_audio(
+        self,
+    ) -> None:
+        provider = _BlockingRetrievalProvider()
+        retrieval_model = AsyncRetrievalLanguageModel(
+            _AsyncRetrievalLanguageModel(), provider
+        )
+        processor = StreamingRealtimeTurnProcessor(
+            _Transcriber(_CurrentNewsTranscriberSession()),
+            retrieval_model,
+            _SmallSynthesizer(),
+            debug_conversation=True,
+        )
+        turn = _turn()
+        sink = _Sink()
+        with self.assertLogs(
+            "local_voice_api.realtime_pipeline", level=logging.INFO
+        ) as captured:
+            processing = asyncio.create_task(
+                processor.process_turn(turn, sink, turn.cancel_event)
+            )
+            await asyncio.wait_for(sink.first_audio_sent.wait(), timeout=1)
+
+            turn.cancel_event.set()
+            await processor.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await processing
+
+        self.assertTrue(provider.cancelled)
+        self.assertEqual(1, len(_sentence_texts(sink)))
+        self.assertLessEqual(
+            len(_sentence_texts(sink)[0].rstrip(".!?").split()),
+            5,
+        )
+        self.assertEqual(1, len(sink.audio))
+        logs = "\n".join(captured.output)
+        self.assertIn("[AIRA TURN SUMMARY]", logs)
+        self.assertIn("status=cancelled", logs)
+        self.assertNotIn("AANYA:", logs)
+        await processor.close()
 
     async def test_pipeline_forwards_incremental_synthesizer_chunks_in_order(
         self,

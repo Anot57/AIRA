@@ -111,6 +111,10 @@ class RealtimeInferenceUnavailableError(RuntimeError):
     """The transport exists but a realtime inference adapter is unavailable."""
 
 
+class RealtimeSttTimeoutError(RuntimeError):
+    """A submitted realtime turn exceeded its bounded STT deadline."""
+
+
 @dataclass(frozen=True, slots=True)
 class StreamingTranscript:
     text: str

@@ -87,8 +87,8 @@ void main() {
     ];
     final onset = <Uint8List>[
       _pcm(amplitude: 1000),
-      _pcm(amplitude: 1100),
-      _pcm(amplitude: 1200),
+      _pcm(amplitude: 1300),
+      _pcm(amplitude: 900),
     ];
     for (final frame in <Uint8List>[...leadingSilence, ...onset]) {
       harness.addPcm(frame, advance: const Duration(milliseconds: 40));
@@ -113,7 +113,7 @@ void main() {
     // Three onset frames plus five 40 ms trailing frames. The remaining
     // 2.8 seconds used to confirm the endpoint stay local to the VAD.
     expect(harness.socket.sentBinary, hasLength(8));
-    expect(harness.socket.sentBinary.take(3), everyElement(_voicePcm));
+    expect(harness.socket.sentBinary.take(3), everyElement(isNot(_quietPcm)));
     expect(harness.socket.sentBinary.skip(3), everyElement(_quietPcm));
   });
 
@@ -139,9 +139,16 @@ void main() {
       for (var frame = 0; frame < initialSilenceFrames; frame += 1) {
         harness.addPcm(_quietPcm, advance: const Duration(milliseconds: 40));
       }
-      final voice = _pcm(amplitude: profile.$2);
       for (var frame = 0; frame < profile.$3; frame += 1) {
-        harness.addPcm(voice, advance: const Duration(milliseconds: 40));
+        final modulation = switch (frame % 3) {
+          0 => 1.0,
+          1 => 1.2,
+          _ => 1.05,
+        };
+        harness.addPcm(
+          _pcm(amplitude: (profile.$2 * modulation).round()),
+          advance: const Duration(milliseconds: 40),
+        );
       }
       await harness.silenceUntilEndpoint();
 
@@ -425,6 +432,187 @@ void main() {
     expect(harness.socket.closeCount, 1);
     expect(harness.platform.endCount, 1);
   });
+
+  test('Back during microphone start invalidates the pending start', () async {
+    final harness = _Harness(resourceShutdownTimeout: const Duration(milliseconds: 20));
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    final startGate = Completer<void>();
+    harness.recorder.startGate = startGate;
+
+    final starting = harness.controller.startCall();
+    await _waitFor(() => harness.recorder.startCount == 1);
+    await harness.controller.endCall().timeout(const Duration(seconds: 1));
+    startGate.complete();
+    await starting;
+    await _flush();
+
+    expect(harness.controller.state.phase, VoiceCallPhase.ended);
+    expect(harness.recorder.startCount, 1);
+    expect(harness.recorder.cancelCount, 1);
+  });
+
+  test('Back is exact-once during processing and retrieval wait', () async {
+    for (final label in <String>['processing', 'retrieval']) {
+      final harness = _Harness();
+      await harness.initialize();
+      await harness.startCall();
+      await harness.endpointUserSpeech();
+      harness.socket.sendJson(_turn('stt_final', text: '$label request'));
+      await _flush();
+      expect(harness.controller.state.phase, VoiceCallPhase.thinking);
+
+      await Future.wait(<Future<void>>[
+        harness.controller.endCall(),
+        harness.controller.endCall(),
+      ]);
+
+      expect(harness.controller.state.phase, VoiceCallPhase.ended);
+      expect(harness.platform.endCount, 1);
+      expect(harness.connector.connectCount, 1);
+      await harness.dispose();
+    }
+  });
+
+  test('Back during speaking stops playback and closes exactly once', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'Hello'))
+      ..sendJson(_turn('text_delta', delta: 'Hello there.'))
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[1, 0, 2, 0]);
+    await _flush();
+    expect(harness.controller.state.phase, VoiceCallPhase.speaking);
+
+    await harness.controller.endCall();
+
+    expect(harness.controller.state.phase, VoiceCallPhase.ended);
+    expect(harness.playback.stopCount, greaterThanOrEqualTo(2));
+    expect(harness.socket.closeCount, 1);
+    expect(harness.platform.endCount, 1);
+  });
+
+  test('intentional Back cancels a scheduled reconnect', () async {
+    final reconnectGate = Completer<void>();
+    final harness = _Harness(extraSockets: 1, reconnectGate: reconnectGate);
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+
+    await harness.socket.serverDisconnect();
+    await _waitFor(
+      () => harness.controller.state.phase == VoiceCallPhase.reconnecting,
+    );
+    await harness.controller.endCall();
+    reconnectGate.complete();
+    await _flush(12);
+
+    expect(harness.connector.connectCount, 1);
+    expect(harness.controller.state.phase, VoiceCallPhase.ended);
+  });
+
+  test('call N callbacks cannot mutate a fresh call N plus 1', () async {
+    final first = _Harness();
+    await first.initialize();
+    await first.startCall();
+    final firstGeneration = first.recorder.callGeneration;
+    await first.controller.endCall();
+
+    final second = _Harness();
+    await second.initialize();
+    await second.startCall();
+    final secondGeneration = second.recorder.callGeneration;
+
+    first.socket.sendJson(_turn('stt_final', text: 'stale'));
+    first.recorder.add(_voicePcm);
+    first.platform.emitFocus('gain');
+    await _flush();
+
+    expect(secondGeneration, isNot(firstGeneration));
+    expect(second.controller.state.phase, VoiceCallPhase.listening);
+    expect(second.recorder.startCount, 1);
+    await first.dispose();
+    await second.dispose();
+  });
+
+  test('capture stall watchdog restarts microphone capture', () async {
+    final harness = _Harness(
+      captureStallTimeout: const Duration(milliseconds: 10),
+    );
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+
+    await _waitFor(() => harness.recorder.startCount >= 2);
+
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+    expect(harness.recorder.cancelCount, greaterThanOrEqualTo(1));
+  });
+
+  test('maximum speech watchdog submits a bounded turn', () async {
+    final harness = _Harness(
+      maximumSpeechDuration: const Duration(milliseconds: 10),
+    );
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    harness.confirmSpeech();
+
+    await _waitFor(() => _sentTypes(harness.socket).contains('end_of_turn'));
+
+    expect(harness.recorder.stopCount, 1);
+    expect(harness.controller.state.phase, VoiceCallPhase.finalizingUserTurn);
+  });
+
+  test('server progress watchdog cancels and resumes listening', () async {
+    final harness = _Harness(
+      serverProgressTimeout: const Duration(milliseconds: 10),
+    );
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+
+    await _waitFor(() => _sentTypes(harness.socket).contains('cancel_turn'));
+    harness.socket.sendJson(_cancelled(turnId: 'turn-1'));
+    await _waitFor(() => harness.recorder.startCount >= 2);
+
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+  });
+
+  test('failed microphone start recovers instead of deadlocking', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    harness.recorder.startFailures = 1;
+
+    await harness.controller.startCall().timeout(const Duration(seconds: 1));
+    await _waitFor(() => harness.recorder.startCount >= 2);
+    await _flush();
+
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+    await harness.endpointUserSpeech();
+  });
+
+  test('Back cleanup remains bounded when platform resources hang', () async {
+    final harness = _Harness(
+      resourceShutdownTimeout: const Duration(milliseconds: 10),
+    );
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    harness.recorder.cancelGate = Completer<void>();
+    harness.platform.endGate = Completer<void>();
+
+    await harness.controller.endCall().timeout(const Duration(seconds: 1));
+
+    expect(harness.controller.state.phase, VoiceCallPhase.ended);
+    expect(harness.socket.closeCount, 1);
+  });
 }
 
 final class _MutableClock {
@@ -434,7 +622,14 @@ final class _MutableClock {
 }
 
 final class _Harness {
-  _Harness({int extraSockets = 0}) {
+  _Harness({
+    int extraSockets = 0,
+    this.reconnectGate,
+    Duration captureStallTimeout = const Duration(seconds: 30),
+    Duration maximumSpeechDuration = const Duration(seconds: 30),
+    Duration serverProgressTimeout = const Duration(seconds: 30),
+    Duration resourceShutdownTimeout = const Duration(seconds: 3),
+  }) {
     sockets = List<_FakeSocket>.generate(
       extraSockets + 1,
       (_) => _FakeSocket(),
@@ -447,7 +642,7 @@ final class _Harness {
       handshakeTimeout: const Duration(seconds: 30),
       cancelAckTimeout: const Duration(milliseconds: 100),
       reconnectDelays: const <Duration>[Duration.zero],
-      reconnectDelay: (_) async {},
+      reconnectDelay: (_) => reconnectGate?.future ?? Future<void>.value(),
     );
     controller = AanyaRealtimeVoiceCallController(
       companionId: 'aanya',
@@ -458,6 +653,10 @@ final class _Harness {
       monotonicNow: clock.call,
       recoveryDelay: (_) async {},
       zeroAudioTimeout: const Duration(seconds: 30),
+      captureStallTimeout: captureStallTimeout,
+      maximumSpeechDuration: maximumSpeechDuration,
+      serverProgressTimeout: serverProgressTimeout,
+      resourceShutdownTimeout: resourceShutdownTimeout,
     );
   }
 
@@ -466,6 +665,7 @@ final class _Harness {
   final _FakeRecorder recorder = _FakeRecorder();
   final _FakePlayback playback = _FakePlayback();
   final _FakeActiveCallPlatform platform = _FakeActiveCallPlatform();
+  final Completer<void>? reconnectGate;
   late final List<_FakeSocket> sockets;
   _FakeSocket get socket => sockets.first;
   late final AanyaRealtimeClient client;
@@ -489,8 +689,11 @@ final class _Harness {
   }
 
   void confirmSpeech() {
-    for (var frame = 0; frame < 3; frame += 1) {
-      addPcm(_voicePcm, advance: const Duration(milliseconds: 40));
+    for (final amplitude in <int>[4200, 5800, 5000]) {
+      addPcm(
+        _pcm(amplitude: amplitude),
+        advance: const Duration(milliseconds: 40),
+      );
     }
   }
 
@@ -528,13 +731,23 @@ final class _Harness {
   }
 }
 
-final class _FakeRecorder implements RealtimeVoiceRecorder {
+final class _FakeRecorder
+    implements
+        RealtimeVoiceRecorder,
+        CallGenerationAwareRealtimeVoiceRecorder {
   StreamController<Uint8List>? _stream;
   int prepareCount = 0;
   int startCount = 0;
   int stopCount = 0;
   int cancelCount = 0;
   bool disposed = false;
+  int? callGeneration;
+  Completer<void>? startGate;
+  Completer<void>? cancelGate;
+  int startFailures = 0;
+
+  @override
+  void bindCallGeneration(int generation) => callGeneration = generation;
 
   @override
   Future<bool> hasPermission() async => true;
@@ -547,7 +760,15 @@ final class _FakeRecorder implements RealtimeVoiceRecorder {
   @override
   Future<Stream<Uint8List>> startPcm16Stream() async {
     startCount += 1;
+    if (startFailures > 0) {
+      startFailures -= 1;
+      throw const RealtimeMicrophoneException(
+        'capture_busy',
+        'Microphone capture is stopping.',
+      );
+    }
     _stream = StreamController<Uint8List>(sync: true);
+    await startGate?.future;
     return _stream!.stream;
   }
 
@@ -564,6 +785,7 @@ final class _FakeRecorder implements RealtimeVoiceRecorder {
   @override
   Future<void> cancel() async {
     cancelCount += 1;
+    await cancelGate?.future;
     if (!(_stream?.isClosed ?? true)) await _stream!.close();
   }
 
@@ -623,6 +845,7 @@ final class _FakeActiveCallPlatform implements ActiveCallPlatform {
   int endCount = 0;
   int updateCount = 0;
   int generation = 0;
+  Completer<void>? endGate;
 
   @override
   Stream<ActiveCallPlatformEvent> get events => _events.stream;
@@ -645,6 +868,7 @@ final class _FakeActiveCallPlatform implements ActiveCallPlatform {
   @override
   Future<void> endCall({required int generation}) async {
     endCount += 1;
+    await endGate?.future;
   }
 
   void emitFocus(String focus) {
@@ -816,4 +1040,12 @@ Future<void> _flush([int count = 6]) async {
   for (var i = 0; i < count; i += 1) {
     await Future<void>.delayed(Duration.zero);
   }
+}
+
+Future<void> _waitFor(bool Function() predicate) async {
+  for (var attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 2));
+  }
+  fail('Condition did not become true.');
 }

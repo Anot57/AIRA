@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -150,10 +151,16 @@ class WarmupCoordinator:
         await task
 
     async def _run(self) -> None:
+        warmup_started = time.perf_counter()
+        _LOGGER.info("[AIRA WARMUP] event=warmup_start")
         self.registry.begin_warmup()
         for step in self._steps:
             self.registry.set_component(step.component, ComponentStatus.LOADING)
-            _LOGGER.info("Starting local warmup component=%s", step.component)
+            step_started = time.perf_counter()
+            _LOGGER.info(
+                "[AIRA WARMUP] event=component_start component=%s",
+                step.component,
+            )
             try:
                 await asyncio.to_thread(step.callback)
             except asyncio.CancelledError:
@@ -166,8 +173,17 @@ class WarmupCoordinator:
                 )
                 return
             self.registry.set_component(step.component, ComponentStatus.READY)
-            _LOGGER.info("Completed local warmup component=%s", step.component)
+            _LOGGER.info(
+                "[AIRA WARMUP] event=component_complete component=%s "
+                "elapsed_ms=%.3f",
+                step.component,
+                (time.perf_counter() - step_started) * 1000,
+            )
         self.registry.finish_ready()
+        _LOGGER.info(
+            "[AIRA WARMUP] event=warmup_complete warmup_elapsed_ms=%.3f",
+            (time.perf_counter() - warmup_started) * 1000,
+        )
 
     async def close(self) -> None:
         async with self._start_lock:

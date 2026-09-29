@@ -103,9 +103,9 @@ internal class PcmCapture(
         when (call.method) {
             "state" -> result.success(snapshot())
             "prepare" -> prepare(result)
-            "start" -> start(result)
-            "stop" -> stopInternal(result, "client_stop")
-            "cancel" -> stopInternal(result, "client_cancel")
+            "start" -> start(call, result)
+            "stop" -> stop(call, result, "client_stop")
+            "cancel" -> stop(call, result, "client_cancel")
             "dispose" -> {
                 stopInternal(result, "flutter_adapter_disposed")
             }
@@ -113,14 +113,19 @@ internal class PcmCapture(
         }
     }
 
-    private fun start(result: MethodChannel.Result) {
+    private fun start(call: MethodCall, result: MethodChannel.Result) {
+        val callGeneration = call.argument<Int>("callGeneration")
+        if (callGeneration == null || !AanyaCallRuntime.isCurrent(callGeneration)) {
+            result.error("stale_call_generation", "The AI call generation is no longer active.", snapshot())
+            return
+        }
         val token: Int
         synchronized(lock) {
             if (disposed || state == State.RELEASED) {
                 result.error("capture_released", "Microphone capture was released.", null)
                 return
             }
-            if (!AanyaCallRuntime.isActive) {
+            if (!AanyaCallRuntime.isCurrent(callGeneration)) {
                 result.error(
                     "active_call_required",
                     "Microphone capture requires an active foreground AI call.",
@@ -150,6 +155,15 @@ internal class PcmCapture(
                 "monotonic_ns=${SystemClock.elapsedRealtimeNanos()}",
         )
         handler.post { initializeAndRead(token, result) }
+    }
+
+    private fun stop(call: MethodCall, result: MethodChannel.Result, reason: String) {
+        val callGeneration = call.argument<Int>("callGeneration")
+        if (callGeneration == null || callGeneration != AanyaCallRuntime.generation) {
+            result.success(snapshot() + mapOf("staleCommandIgnored" to true))
+            return
+        }
+        stopInternal(result, reason)
     }
 
     private fun prepare(result: MethodChannel.Result) {

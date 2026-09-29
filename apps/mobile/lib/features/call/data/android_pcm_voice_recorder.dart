@@ -9,12 +9,16 @@ import '../application/voice_io.dart';
 ///
 /// The record package is deliberately used only for the established runtime
 /// permission flow. PCM capture itself always comes from the native channels.
-final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
+final class AndroidPcmVoiceRecorder
+    implements
+        RealtimeVoiceRecorder,
+        CallGenerationAwareRealtimeVoiceRecorder {
   AndroidPcmVoiceRecorder({
     AudioRecorder? permissionRecorder,
     Future<bool> Function()? permissionChecker,
     MethodChannel? methodChannel,
     EventChannel? eventChannel,
+    this.platformOperationTimeout = const Duration(seconds: 3),
   }) : _permissionRecorder = permissionChecker == null
            ? (permissionRecorder ?? AudioRecorder())
            : null,
@@ -29,16 +33,25 @@ final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
   final Future<bool> Function()? _permissionChecker;
   final MethodChannel _methodChannel;
   final EventChannel _eventChannel;
+  final Duration platformOperationTimeout;
 
   StreamSubscription<Object?>? _nativeSubscription;
   StreamController<Uint8List>? _turnController;
   Future<void>? _closeInFlight;
   bool _disposed = false;
+  int? _callGeneration;
   int capturedBytes = 0;
   int capturedFrames = 0;
   int deliveredBytes = 0;
   String nativeState = 'uninitialized';
   String? audioSource;
+
+  @override
+  void bindCallGeneration(int generation) {
+    if (_disposed) throw StateError('Native microphone recorder is disposed.');
+    if (generation <= 0) throw ArgumentError.value(generation, 'generation');
+    _callGeneration = generation;
+  }
 
   @override
   Future<bool> hasPermission() =>
@@ -60,6 +73,10 @@ final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
     if (_turnController != null) {
       throw StateError('A native microphone stream is already active.');
     }
+    final callGeneration = _callGeneration;
+    if (callGeneration == null) {
+      throw StateError('Native microphone recorder has no call generation.');
+    }
 
     capturedBytes = 0;
     capturedFrames = 0;
@@ -77,21 +94,32 @@ final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
     try {
       final result = await _methodChannel.invokeMapMethod<String, Object?>(
         'start',
-      );
+        <String, Object?>{'callGeneration': callGeneration},
+      ).timeout(platformOperationTimeout);
       _updateSnapshot(result);
       return controller.stream;
-    } on PlatformException catch (error, stack) {
-      await _nativeSubscription?.cancel();
+    } on Object catch (error, stack) {
+      unawaited(_cancelNative(callGeneration));
+      try {
+        await _nativeSubscription?.cancel().timeout(platformOperationTimeout);
+      } on Object {
+        // A detached event channel must not hold call teardown open.
+      }
       _nativeSubscription = null;
       _turnController = null;
-      await controller.close();
-      Error.throwWithStackTrace(
-        RealtimeMicrophoneException(
-          error.code,
-          error.message ?? 'Android microphone failed to start.',
-        ),
-        stack,
-      );
+      // Nobody has received this stream, so its close() future never
+      // completes; awaiting it would turn every start failure into a hang.
+      unawaited(controller.close());
+      if (error is PlatformException) {
+        Error.throwWithStackTrace(
+          RealtimeMicrophoneException(
+            error.code,
+            error.message ?? 'Android microphone failed to start.',
+          ),
+          stack,
+        );
+      }
+      Error.throwWithStackTrace(error, stack);
     }
   }
 
@@ -162,29 +190,45 @@ final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
     _turnController = null;
     final subscription = _nativeSubscription;
     _nativeSubscription = null;
-    await subscription?.cancel();
-    if (controller != null && !controller.isClosed) await controller.close();
+    try {
+      await subscription?.cancel().timeout(platformOperationTimeout);
+    } on Object {
+      // Stream ownership is already cleared above.
+    }
+    // Do not await close(): for a stream the caller abandoned without
+    // listening, it never completes and would wedge _closeInFlight, blocking
+    // every later startPcm16Stream(). Listeners still receive onDone.
+    if (controller != null && !controller.isClosed) {
+      unawaited(controller.close());
+    }
   }
 
   @override
   Future<void> stopStream() async {
     if (_turnController == null) return;
+    final callGeneration = _callGeneration;
+    if (callGeneration == null) return;
     final snapshot = await _methodChannel.invokeMapMethod<String, Object?>(
       'stop',
-    );
+      <String, Object?>{'callGeneration': callGeneration},
+    ).timeout(platformOperationTimeout);
     _updateSnapshot(snapshot);
     await _closeCurrent();
   }
 
   @override
   Future<void> cancel() async {
+    final callGeneration = _callGeneration;
     if (_turnController != null) {
       try {
-        final snapshot = await _methodChannel.invokeMapMethod<String, Object?>(
-          'cancel',
-        );
+        final snapshot = callGeneration == null
+            ? null
+            : await _methodChannel.invokeMapMethod<String, Object?>(
+                'cancel',
+                <String, Object?>{'callGeneration': callGeneration},
+              ).timeout(platformOperationTimeout);
         _updateSnapshot(snapshot);
-      } on PlatformException {
+      } on Object {
         // Native teardown is best effort after lifecycle loss.
       }
     }
@@ -197,5 +241,16 @@ final class AndroidPcmVoiceRecorder implements RealtimeVoiceRecorder {
     await cancel();
     _disposed = true;
     await _permissionRecorder?.dispose();
+  }
+
+  Future<void> _cancelNative(int callGeneration) async {
+    try {
+      await _methodChannel.invokeMapMethod<String, Object?>(
+        'cancel',
+        <String, Object?>{'callGeneration': callGeneration},
+      ).timeout(platformOperationTimeout);
+    } on Object {
+      // A timed-out start is already invalid from the Dart call's perspective.
+    }
   }
 }

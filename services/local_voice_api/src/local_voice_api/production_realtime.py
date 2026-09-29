@@ -19,9 +19,15 @@ from .llama_server import (
     LlamaServerConfig,
     LlamaServerStreamingLanguageModel,
 )
+from .observability import debug_conversation_enabled
 from .pocket_tts import PocketTtsWorkerConfig, PocketTtsWorkerSynthesizer
 from .realtime_pipeline import RealtimeTurnProcessor, StreamingRealtimeTurnProcessor
 from .realtime_protocol import PcmAudioFormat
+from .retrieval import (
+    AsyncRetrievalLanguageModel,
+    RetrievalAugmentedLanguageModel,
+    retrieval_provider_from_environment,
+)
 from .streaming import (
     BoundedBatchStreamingTranscriber,
     CompleteResponseStreamingLlmAdapter,
@@ -40,6 +46,7 @@ from .transcription import (
 
 REALTIME_LLM_PROVIDER_ENVIRONMENT = "AIRA_REALTIME_LLM_PROVIDER"
 REALTIME_STT_CONCURRENCY_ENVIRONMENT = "AIRA_REALTIME_STT_CONCURRENCY"
+ASYNC_RETRIEVAL_ENVIRONMENT = "AIRA_ASYNC_RETRIEVAL"
 
 
 def _realtime_llm_provider(
@@ -61,6 +68,19 @@ def _realtime_llm_provider(
 
     return provider
 
+
+def _async_retrieval_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environ is None else environ
+    return source.get(ASYNC_RETRIEVAL_ENVIRONMENT, "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def build_pocket_realtime_processor_factory(
     environ: Mapping[str, str] | None = None,
 ) -> Callable[[], RealtimeTurnProcessor]:
@@ -80,6 +100,9 @@ def build_pocket_realtime_processor_factory(
         if llm_provider == "llama_server"
         else None
     )
+    retrieval_provider = retrieval_provider_from_environment(environ)
+    async_retrieval = _async_retrieval_enabled(environ)
+    debug_conversation = debug_conversation_enabled(environ)
 
     def create_processor() -> RealtimeTurnProcessor:
         if llama_server_config is not None:
@@ -93,13 +116,22 @@ def build_pocket_realtime_processor_factory(
                 _generate_response
             )
 
+        retrieval_language_model = (
+            AsyncRetrievalLanguageModel(language_model, retrieval_provider)
+            if async_retrieval
+            else RetrievalAugmentedLanguageModel(
+                language_model, retrieval_provider
+            )
+        )
+
         return StreamingRealtimeTurnProcessor(
             BoundedBatchStreamingTranscriber(
                 _transcribe_pcm,
                 admission=stt_admission,
             ),
-            language_model,
+            retrieval_language_model,
             PocketTtsWorkerSynthesizer(worker_config),
+            debug_conversation=debug_conversation,
         )
 
     create_processor.capacity_snapshot = lambda: {  # type: ignore[attr-defined]

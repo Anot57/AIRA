@@ -197,6 +197,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   Timer? _handshakeTimer;
   RealtimeAudioChunkEvent? _pendingServerAudio;
   var _connectionGeneration = 0;
+  var _reconnectScheduleGeneration = 0;
   var _reconnectAttempt = 0;
   var _nextServerAudioSequence = 0;
   var _nextServerSentenceSequence = 1;
@@ -211,6 +212,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   String? _cancellingServerTurnId;
   RealtimeProtocolViolation? _lastProtocolViolation;
   var _allowReconnect = false;
+  var _intentionalClose = false;
   var _isForeground = true;
   var _disposed = false;
   Future<void> _shutdownComplete = Future<void>.value();
@@ -223,6 +225,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   /// [AanyaRealtimePhase.ready].
   Future<void> connect() {
     if (_disposed) return Future<void>.value();
+    _intentionalClose = false;
     _allowReconnect = true;
     if (_socket != null) return Future<void>.value();
     final existing = _connectInFlight;
@@ -555,7 +558,10 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     required bool allowFutureReconnect,
     required String statusLabel,
   }) async {
+    _intentionalClose = true;
     _allowReconnect = false;
+    ++_reconnectScheduleGeneration;
+    _debugLog('lifecycle event=closing intentional=true');
     _completeCancellation(false);
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
@@ -574,12 +580,13 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       } on Object {
         // A closing transport may already reject writes.
       }
-      await subscription?.cancel();
+      await _safeCancelSubscription(subscription);
       await _safeClose(socket);
     }
     _resetTurn();
     _allowReconnect = allowFutureReconnect && !_disposed;
     if (!_disposed) _emitOffline(statusLabel);
+    _debugLog('lifecycle event=closed intentional=true');
   }
 
   void _handleSocketMessage(
@@ -1031,11 +1038,12 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     final subscription = _socketSubscription;
     _socketSubscription = null;
     _resetTurn();
-    await subscription?.cancel();
+    await _safeCancelSubscription(subscription);
     await _safeClose(socket);
     if (_disposed) return;
-    _emitOffline(_allowReconnect ? 'Recovering' : 'Offline');
-    _scheduleReconnect();
+    final shouldReconnect = _allowReconnect && !_intentionalClose;
+    _emitOffline(shouldReconnect ? 'Recovering' : 'Offline');
+    if (shouldReconnect) _scheduleReconnect();
   }
 
   Future<void> _recoverFromCancelTimeout(
@@ -1061,7 +1069,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         clearError: true,
       ),
     );
-    await subscription?.cancel();
+    await _safeCancelSubscription(subscription);
     await _safeClose(socket, 1001, 'cancel acknowledgement timeout');
     if (!_disposed && _allowReconnect && _socket == null) {
       await connect();
@@ -1070,6 +1078,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
 
   void _scheduleReconnect() {
     if (_disposed ||
+        _intentionalClose ||
         !_allowReconnect ||
         _socket != null ||
         _connectInFlight != null ||
@@ -1090,6 +1099,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       reconnectDelays.length - 1,
     );
     final delay = reconnectDelays[reconnectIndex];
+    final scheduleGeneration = _reconnectScheduleGeneration;
     _reconnectAttempt += 1;
     _emit(
       _state.copyWith(
@@ -1098,9 +1108,17 @@ final class AanyaRealtimeClient extends ChangeNotifier {
         clearSession: true,
       ),
     );
+    _debugLog(
+      'lifecycle event=reconnect_scheduled intentional=false '
+      'schedule_generation=$scheduleGeneration delay_ms=${delay.inMilliseconds}',
+    );
     final operation = () async {
       await _reconnectDelay(delay);
-      if (!_disposed && _allowReconnect && _socket == null) {
+      if (!_disposed &&
+          !_intentionalClose &&
+          _allowReconnect &&
+          scheduleGeneration == _reconnectScheduleGeneration &&
+          _socket == null) {
         await connect();
       }
     }();
@@ -1111,7 +1129,9 @@ final class AanyaRealtimeClient extends ChangeNotifier {
           _reconnectInFlight = null;
         }
         if (!_disposed &&
+            !_intentionalClose &&
             _allowReconnect &&
+            scheduleGeneration == _reconnectScheduleGeneration &&
             _socket == null &&
             _connectInFlight == null) {
           _scheduleReconnect();
@@ -1180,6 +1200,16 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
   }
 
+  Future<void> _safeCancelSubscription(
+    StreamSubscription<Object?>? subscription,
+  ) async {
+    try {
+      await subscription?.cancel().timeout(closeTimeout);
+    } on Object {
+      // Ownership is already invalidated by the connection generation.
+    }
+  }
+
   void _emit(AanyaRealtimeState next) {
     if (_disposed) return;
     _state = next;
@@ -1201,7 +1231,9 @@ final class AanyaRealtimeClient extends ChangeNotifier {
   @override
   void dispose() {
     if (_disposed) return;
+    _intentionalClose = true;
     _allowReconnect = false;
+    ++_reconnectScheduleGeneration;
     _completeCancellation(false);
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
@@ -1232,7 +1264,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
       } on Object {
         // The transport may already be gone.
       }
-      await subscription?.cancel();
+      await _safeCancelSubscription(subscription);
       await _safeClose(socket);
     }
     _resetTurn();

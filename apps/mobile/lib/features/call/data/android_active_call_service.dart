@@ -36,6 +36,7 @@ final class AndroidActiveCallService implements ActiveCallPlatform {
       StreamController<ActiveCallPlatformEvent>.broadcast(sync: true);
   StreamSubscription<Object?>? _subscription;
   final Map<int, Completer<void>> _serviceStarts = <int, Completer<void>>{};
+  final Map<int, Completer<void>> _serviceEnds = <int, Completer<void>>{};
   bool _disposed = false;
 
   @override
@@ -67,13 +68,34 @@ final class AndroidActiveCallService implements ActiveCallPlatform {
   });
 
   @override
-  Future<void> endCall({required int generation}) =>
-      _invoke('endCall', <String, Object?>{'generation': generation});
+  Future<void> endCall({required int generation}) async {
+    final ended = Completer<void>();
+    _serviceEnds[generation] = ended;
+    try {
+      final snapshot = await _invoke('endCall', <String, Object?>{
+        'generation': generation,
+      });
+      if (snapshot?['active'] == false && snapshot?['ending'] == false) {
+        if (!ended.isCompleted) ended.complete();
+      }
+      await ended.future.timeout(const Duration(seconds: 3));
+    } finally {
+      if (identical(_serviceEnds[generation], ended)) {
+        _serviceEnds.remove(generation);
+      }
+    }
+  }
 
-  Future<void> _invoke(String method, Map<String, Object?> arguments) async {
+  Future<Map<Object?, Object?>?> _invoke(
+    String method,
+    Map<String, Object?> arguments,
+  ) async {
     if (_disposed) throw StateError('Active call platform is disposed.');
     try {
-      await _methodChannel.invokeMapMethod<String, Object?>(method, arguments);
+      return await _methodChannel.invokeMapMethod<Object?, Object?>(
+        method,
+        arguments,
+      );
     } on PlatformException catch (error) {
       throw ActiveCallPlatformException(
         error.code,
@@ -110,6 +132,10 @@ final class AndroidActiveCallService implements ActiveCallPlatform {
       final ready = _serviceStarts[generation];
       if (ready != null && !ready.isCompleted) ready.complete();
     }
+    if (type == ActiveCallPlatformEventType.ended) {
+      final ended = _serviceEnds[generation];
+      if (ended != null && !ended.isCompleted) ended.complete();
+    }
     _events.add(
       ActiveCallPlatformEvent(
         type: type,
@@ -133,6 +159,12 @@ final class AndroidActiveCallService implements ActiveCallPlatform {
       }
     }
     _serviceStarts.clear();
+    for (final pending in _serviceEnds.values) {
+      if (!pending.isCompleted) {
+        pending.completeError(StateError('Active call platform was disposed.'));
+      }
+    }
+    _serviceEnds.clear();
     await _subscription?.cancel();
     await _events.close();
   }

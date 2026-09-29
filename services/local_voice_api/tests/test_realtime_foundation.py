@@ -131,6 +131,25 @@ class ReadinessRegistryTests(unittest.TestCase):
 
 
 class WarmupCoordinatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_warmup_logs_bounded_component_and_total_durations(self) -> None:
+        registry = ReadinessRegistry(("llm",))
+        coordinator = WarmupCoordinator(
+            registry,
+            (WarmupStep("llm", lambda: None),),
+        )
+
+        with self.assertLogs("local_voice_api.readiness") as captured:
+            await coordinator.wait()
+
+        logs = "\n".join(captured.output)
+        self.assertIn("event=warmup_start", logs)
+        self.assertIn("event=component_start component=llm", logs)
+        self.assertRegex(
+            logs,
+            r"event=component_complete component=llm elapsed_ms=\d+\.\d+",
+        )
+        self.assertRegex(logs, r"event=warmup_complete warmup_elapsed_ms=\d+\.\d+")
+
     async def test_success_runs_each_step_off_loop_and_marks_ready(self) -> None:
         registry = ReadinessRegistry(("stt", "llm", "tts"))
         event_loop_thread = threading.get_ident()

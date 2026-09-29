@@ -110,6 +110,12 @@ abstract interface class RealtimeVoiceRecorder {
   Future<void> dispose();
 }
 
+/// Optional binding for process-owned recorders that must reject stale call
+/// teardown from an older Flutter route.
+abstract interface class CallGenerationAwareRealtimeVoiceRecorder {
+  void bindCallGeneration(int generation);
+}
+
 /// Streaming playback boundary used by the Aanya call controller.
 abstract interface class VoicePlayback {
   Future<void> play(Uri audioUri, {required void Function() onPlaybackStarted});

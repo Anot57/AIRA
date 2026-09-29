@@ -9,6 +9,10 @@ import time
 from typing import Protocol
 
 from .conversation import normalize_companion_transcript
+from .observability import (
+    RealtimeConversationMonitor,
+    current_realtime_debug_turn,
+)
 from .realtime_protocol import (
     MAX_AUDIO_CHUNK_BYTES,
     MAX_PLAYBACK_SAMPLE_RATE_HZ,
@@ -24,6 +28,7 @@ from .streaming import (
     LeadingSpeakerLabelNormalizer,
     NoSpeechDetectedError,
     RealtimeInferenceUnavailableError,
+    RealtimeSttTimeoutError,
     RealtimeSynthesizer,
     SpeakableTextChunker,
     StreamingRealtimeSynthesizer,
@@ -32,6 +37,7 @@ from .streaming import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+MAX_ACCEPTED_NO_SPEECH_PROBABILITY = 0.60
 
 
 class RealtimeEventSink(Protocol):
@@ -41,6 +47,8 @@ class RealtimeEventSink(Protocol):
 
 
 class RealtimeTurnProcessor(Protocol):
+    async def prepare(self) -> None: ...
+
     async def process_turn(
         self,
         turn: RealtimeTurn,
@@ -55,6 +63,9 @@ class RealtimeTurnProcessor(Protocol):
 
 class UnavailableRealtimeTurnProcessor:
     """Honest default until production realtime inference adapters are selected."""
+
+    async def prepare(self) -> None:
+        return None
 
     async def process_turn(
         self,
@@ -82,11 +93,26 @@ class StreamingRealtimeTurnProcessor:
         transcriber: StreamingTranscriber,
         language_model: StreamingLanguageModel,
         synthesizer: RealtimeSynthesizer | StreamingRealtimeSynthesizer,
+        *,
+        debug_conversation: bool = False,
+        stt_timeout_seconds: float = 30.0,
     ) -> None:
+        if stt_timeout_seconds <= 0:
+            raise ValueError("Realtime STT timeout must be positive.")
         self._transcriber = transcriber
         self._language_model = language_model
         self._synthesizer = synthesizer
         self._active_transcriber = None
+        self._conversation_monitor = RealtimeConversationMonitor(
+            debug_conversation,
+            logger=_LOGGER,
+        )
+        self._stt_timeout_seconds = stt_timeout_seconds
+
+    async def prepare(self) -> None:
+        prepare = getattr(self._language_model, "prepare", None)
+        if prepare is not None:
+            await prepare()
 
     async def process_turn(
         self,
@@ -94,9 +120,50 @@ class StreamingRealtimeTurnProcessor:
         sink: RealtimeEventSink,
         cancel_event: threading.Event,
     ) -> None:
+        with self._conversation_monitor.turn(
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            generation=turn.generation,
+            metrics=turn.metrics,
+        ) as debug_turn:
+            try:
+                await self._process_turn(turn, sink, cancel_event)
+            except asyncio.CancelledError:
+                if debug_turn is not None:
+                    debug_turn.cancelled()
+                raise
+            except Exception:
+                if debug_turn is not None:
+                    debug_turn.failed()
+                raise
+
+    async def _process_turn(
+        self,
+        turn: RealtimeTurn,
+        sink: RealtimeEventSink,
+        cancel_event: threading.Event,
+    ) -> None:
+        stt_terminal_status: str | None = None
+
+        def mark_stt_terminal(status: str) -> None:
+            nonlocal stt_terminal_status
+            if stt_terminal_status is not None:
+                return
+            stt_terminal_status = status
+            self._log_timing(turn, "stt_terminal", status=status)
+
         _raise_if_cancelled(cancel_event)
         self._log_timing(turn, "stt_session_start")
-        transcriber_session = await self._transcriber.start_session(turn.audio_format)
+        try:
+            transcriber_session = await self._transcriber.start_session(
+                turn.audio_format
+            )
+        except asyncio.CancelledError:
+            mark_stt_terminal("cancelled")
+            raise
+        except Exception:
+            mark_stt_terminal("error")
+            raise
         self._log_timing(turn, "stt_session_ready")
         self._active_transcriber = transcriber_session
         sentence_sequence = 0
@@ -126,7 +193,40 @@ class StreamingRealtimeTurnProcessor:
                 input_chunks=turn.input_chunk_count,
                 input_bytes=len(turn.audio),
             )
-            transcript = await transcriber_session.finish_turn()
+            try:
+                transcript = await asyncio.wait_for(
+                    transcriber_session.finish_turn(),
+                    timeout=self._stt_timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                mark_stt_terminal("cancelled")
+                raise
+            except TimeoutError as error:
+                mark_stt_terminal("timeout")
+                raise RealtimeSttTimeoutError(
+                    "Realtime transcription exceeded its bounded deadline."
+                ) from error
+            except NoSpeechDetectedError:
+                mark_stt_terminal("no_speech")
+                raise
+            except Exception:
+                mark_stt_terminal("error")
+                raise
+            if transcript.stt_queue_enter_us is not None:
+                turn.metrics.mark_boundary(
+                    "stt_queue_enter",
+                    monotonic_us=transcript.stt_queue_enter_us,
+                )
+            if transcript.stt_start_us is not None:
+                turn.metrics.mark_boundary(
+                    "stt_start", monotonic_us=transcript.stt_start_us
+                )
+            if transcript.stt_complete_us is not None:
+                turn.metrics.mark_boundary(
+                    "stt_complete", monotonic_us=transcript.stt_complete_us
+                )
+            else:
+                turn.metrics.mark_boundary("stt_complete")
             self._log_timing(
                 turn,
                 "stt_start",
@@ -149,12 +249,28 @@ class StreamingRealtimeTurnProcessor:
             )
             _raise_if_cancelled(cancel_event)
             if transcript.is_final is not True:
+                mark_stt_terminal("error")
                 raise RuntimeError("Realtime transcription did not return a final result.")
             if not isinstance(transcript.text, str) or not transcript.text.strip():
+                mark_stt_terminal("no_speech")
                 raise NoSpeechDetectedError("No speech was detected in this turn.")
+            if (
+                transcript.stt_no_speech_probability is not None
+                and transcript.stt_no_speech_probability
+                >= MAX_ACCEPTED_NO_SPEECH_PROBABILITY
+            ):
+                mark_stt_terminal("no_speech")
+                raise NoSpeechDetectedError(
+                    "Whisper classified this turn as likely non-speech."
+                )
             normalized = normalize_companion_transcript("aanya", transcript.text)
             if len(normalized) > MAX_TRANSCRIPT_TEXT_CHARACTERS:
+                mark_stt_terminal("error")
                 raise RuntimeError("Realtime transcript exceeded its safe limit.")
+            mark_stt_terminal("stt_complete")
+            debug_turn = current_realtime_debug_turn()
+            if debug_turn is not None:
+                debug_turn.log_user(normalized)
             turn.metrics.mark_stt_final()
             await sink.send_json(
                 server_event(
@@ -175,7 +291,11 @@ class StreamingRealtimeTurnProcessor:
                 nonlocal sentence_sequence, first_meaningful_text
                 if not delta:
                     return
+                debug_turn = current_realtime_debug_turn()
+                if debug_turn is not None:
+                    debug_turn.add_response_text(delta)
                 if first_meaningful_text:
+                    turn.metrics.mark_boundary("first_meaningful_text")
                     self._log_timing(turn, "first_meaningful_text")
                     first_meaningful_text = False
                 for offset in range(0, len(delta), MAX_TEXT_DELTA_CHARACTERS):
@@ -210,7 +330,20 @@ class StreamingRealtimeTurnProcessor:
                     )
 
             self._log_timing(turn, "llm_request_start")
-            async for delta in self._language_model.stream(normalized, cancel_event):
+            turn.metrics.mark_boundary("llm_request_start")
+            stream_turn = getattr(self._language_model, "stream_turn", None)
+            if stream_turn is None:
+                response_stream = self._language_model.stream(
+                    normalized, cancel_event
+                )
+            else:
+                response_stream = stream_turn(
+                    normalized,
+                    cancel_event,
+                    session_id=turn.session_id,
+                    generation=turn.generation,
+                )
+            async for delta in response_stream:
                 _raise_if_cancelled(cancel_event)
                 if not isinstance(delta, str):
                     raise RuntimeError("Realtime LLM deltas must be text.")
@@ -220,6 +353,7 @@ class StreamingRealtimeTurnProcessor:
                 if response_characters > MAX_RESPONSE_TEXT_CHARACTERS:
                     raise RuntimeError("Realtime response text exceeded its safe limit.")
                 if first_delta:
+                    turn.metrics.mark_boundary("llm_first_token")
                     turn.metrics.mark_first_llm_token()
                     self._log_timing(turn, "llm_first_token")
                     first_delta = False
@@ -252,9 +386,13 @@ class StreamingRealtimeTurnProcessor:
             if first_sentence or first_audio:
                 raise RuntimeError("Realtime response contained no speakable audio.")
             _raise_if_cancelled(cancel_event)
+            turn.metrics.mark_boundary("turn_complete")
             turn.metrics.mark_complete()
             self._log_timing(turn, "turn_complete")
             turn.metrics.log(_LOGGER)
+            debug_turn = current_realtime_debug_turn()
+            if debug_turn is not None:
+                debug_turn.completed()
             await sink.send_json(
                 server_event(
                     ServerEventType.TURN_COMPLETE,
@@ -263,6 +401,10 @@ class StreamingRealtimeTurnProcessor:
                 )
             )
         finally:
+            if stt_terminal_status is None:
+                mark_stt_terminal(
+                    "cancelled" if cancel_event.is_set() else "error"
+                )
             self._active_transcriber = None
             await transcriber_session.close()
 
@@ -277,7 +419,14 @@ class StreamingRealtimeTurnProcessor:
     ) -> tuple[int, bool]:
         _raise_if_cancelled(cancel_event)
         if first_audio:
+            if (
+                turn.metrics.boundary_monotonic_us("reaction_selected")
+                is not None
+            ):
+                turn.metrics.mark_boundary("reaction_tts_start")
+                self._log_timing(turn, "reaction_tts_start")
             self._log_timing(turn, "tts_queue_enter")
+            turn.metrics.mark_boundary("tts_queue_enter")
         synthesis_started = time.perf_counter()
         previous_chunk_at = synthesis_started
         yielded_audio = False
@@ -298,6 +447,7 @@ class StreamingRealtimeTurnProcessor:
             ):
                 raise RuntimeError("Realtime synthesizer returned unsupported PCM audio.")
             if first_audio:
+                turn.metrics.mark_boundary("tts_first_pcm")
                 turn.metrics.mark_first_audio_sample()
                 self._log_timing(
                     turn,
@@ -349,6 +499,8 @@ class StreamingRealtimeTurnProcessor:
                 )
                 await sink.send_audio(pcm_frame)
                 if first_audio:
+                    turn.metrics.mark_boundary("first_audio_binary_sent")
+                    turn.metrics.mark_boundary("first_audio")
                     turn.metrics.mark_first_audio_sent()
                     self._log_timing(
                         turn,
@@ -393,7 +545,14 @@ class StreamingRealtimeTurnProcessor:
             if self._active_transcriber is not None:
                 await self._active_transcriber.cancel()
         finally:
-            await self._synthesizer.cancel()
+            try:
+                cancel_language_model = getattr(
+                    self._language_model, "cancel_active_turn", None
+                )
+                if cancel_language_model is not None:
+                    await cancel_language_model()
+            finally:
+                await self._synthesizer.cancel()
 
     async def close(self) -> None:
         try:
@@ -401,7 +560,12 @@ class StreamingRealtimeTurnProcessor:
                 await self._active_transcriber.close()
         finally:
             self._active_transcriber = None
-            await self._synthesizer.close()
+            try:
+                await self._synthesizer.close()
+            finally:
+                close_language_model = getattr(self._language_model, "close", None)
+                if close_language_model is not None:
+                    await close_language_model()
 
 
 def _raise_if_cancelled(cancel_event: threading.Event) -> None:

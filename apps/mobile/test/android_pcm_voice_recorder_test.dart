@@ -45,6 +45,7 @@ void main() {
       final recorder = AndroidPcmVoiceRecorder(
         permissionChecker: () async => true,
       );
+      recorder.bindCallGeneration(1);
       final stream = await recorder.startPcm16Stream();
       final received = <List<int>>[];
       final done = Completer<void>();
@@ -75,6 +76,7 @@ void main() {
       final reopened = AndroidPcmVoiceRecorder(
         permissionChecker: () async => true,
       );
+      reopened.bindCallGeneration(2);
       final reopenedStream = await reopened.startPcm16Stream();
       final reopenedDone = reopenedStream.drain<void>();
       await reopened.cancel();
@@ -106,6 +108,7 @@ void main() {
       final recorder = AndroidPcmVoiceRecorder(
         permissionChecker: () async => true,
       );
+      recorder.bindCallGeneration(3);
       final first = await recorder.startPcm16Stream();
       final receivedError = Completer<Object>();
       first.listen(
@@ -130,4 +133,113 @@ void main() {
       );
     },
   );
+
+  test('native recorder requires a bound call generation', () async {
+    final recorder = AndroidPcmVoiceRecorder(
+      permissionChecker: () async => true,
+    );
+
+    await expectLater(recorder.startPcm16Stream(), throwsStateError);
+    await recorder.dispose();
+  });
+
+  test(
+    'cancelling a never-listened stream does not wedge the next start',
+    () async {
+      messenger.setMockMethodCallHandler(capture, (call) async {
+        return <String, Object?>{
+          'state': call.method == 'start' ? 'recording' : 'stopped',
+          'capturedBytes': 0,
+          'capturedFrames': 0,
+        };
+      });
+      final recorder = AndroidPcmVoiceRecorder(
+        permissionChecker: () async => true,
+      )..bindCallGeneration(7);
+
+      // The call controller can abandon a started stream (stale operation or
+      // start timeout) without ever listening to it.
+      await recorder.startPcm16Stream();
+      await recorder.cancel().timeout(const Duration(seconds: 1));
+
+      final next = await recorder.startPcm16Stream().timeout(
+        const Duration(seconds: 1),
+      );
+      final nextDone = next.drain<void>();
+      await recorder.stopStream().timeout(const Duration(seconds: 1));
+      await nextDone.timeout(const Duration(seconds: 1));
+      await recorder.dispose();
+    },
+  );
+
+  test('failed native start throws instead of hanging', () async {
+    messenger.setMockMethodCallHandler(capture, (call) async {
+      if (call.method == 'start') {
+        throw PlatformException(
+          code: 'capture_busy',
+          message: 'Microphone capture is stopping.',
+        );
+      }
+      return <String, Object?>{'state': 'stopped'};
+    });
+    final recorder = AndroidPcmVoiceRecorder(
+      permissionChecker: () async => true,
+    )..bindCallGeneration(8);
+
+    await expectLater(
+      recorder.startPcm16Stream().timeout(const Duration(seconds: 1)),
+      throwsA(
+        isA<RealtimeMicrophoneException>().having(
+          (error) => error.code,
+          'code',
+          'capture_busy',
+        ),
+      ),
+    );
+    await recorder.dispose();
+  });
+
+  test('stale old-generation cancel cannot stop newer native capture', () async {
+    var activeGeneration = 0;
+    var recording = false;
+    final calls = <MethodCall>[];
+    messenger.setMockMethodCallHandler(capture, (call) async {
+      calls.add(call);
+      final arguments = (call.arguments as Map<Object?, Object?>?) ?? const {};
+      final generation = arguments['callGeneration'] as int?;
+      if (call.method == 'start') {
+        activeGeneration = generation!;
+        recording = true;
+      } else if (call.method == 'cancel' && generation == activeGeneration) {
+        recording = false;
+      }
+      return <String, Object?>{
+        'state': recording ? 'recording' : 'stopped',
+        'capturedBytes': 0,
+        'capturedFrames': 0,
+      };
+    });
+    final oldRecorder = AndroidPcmVoiceRecorder(
+      permissionChecker: () async => true,
+    )..bindCallGeneration(41);
+    final newRecorder = AndroidPcmVoiceRecorder(
+      permissionChecker: () async => true,
+    )..bindCallGeneration(42);
+
+    await oldRecorder.startPcm16Stream();
+    await newRecorder.startPcm16Stream();
+    await oldRecorder.cancel();
+
+    expect(activeGeneration, 42);
+    expect(recording, isTrue);
+    expect(
+      calls.where((call) => call.method == 'cancel').last.arguments,
+      <String, Object?>{'callGeneration': 41},
+    );
+
+    await newRecorder.cancel();
+    expect(recording, isFalse);
+    await oldRecorder.dispose();
+    await newRecorder.dispose();
+  });
 }

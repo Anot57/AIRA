@@ -11,6 +11,7 @@ import 'voice_io.dart';
 typedef MonotonicNow = Duration Function();
 
 final Stopwatch _processMonotonicClock = Stopwatch()..start();
+var _nextRealtimeCallGeneration = 0;
 
 final class RealtimeTurnAudioAccounting {
   const RealtimeTurnAudioAccounting({
@@ -82,6 +83,11 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     ActiveCallPlatform? activeCallPlatform,
     this.endpointConfig = const PcmVoiceActivityConfig(),
     this.zeroAudioTimeout = const Duration(milliseconds: 950),
+    this.captureStallTimeout = const Duration(seconds: 3),
+    this.maximumSpeechDuration = const Duration(seconds: 45),
+    this.serverProgressTimeout = const Duration(seconds: 45),
+    this.turnSubmitTimeout = const Duration(seconds: 5),
+    this.resourceShutdownTimeout = const Duration(seconds: 3),
     this.preRollDuration = const Duration(milliseconds: 400),
     this.trailingSpeechPadding = const Duration(milliseconds: 200),
     this.maxPendingNetworkBytes = 256 * 1024,
@@ -98,6 +104,11 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     }
     endpointConfig.validate();
     if (zeroAudioTimeout <= Duration.zero ||
+        captureStallTimeout <= Duration.zero ||
+        maximumSpeechDuration <= Duration.zero ||
+        serverProgressTimeout <= Duration.zero ||
+        turnSubmitTimeout <= Duration.zero ||
+        resourceShutdownTimeout <= Duration.zero ||
         preRollDuration.isNegative ||
         trailingSpeechPadding.isNegative ||
         maxPendingNetworkBytes <= 0) {
@@ -114,6 +125,11 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   final ActiveCallPlatform activeCallPlatform;
   final PcmVoiceActivityConfig endpointConfig;
   final Duration zeroAudioTimeout;
+  final Duration captureStallTimeout;
+  final Duration maximumSpeechDuration;
+  final Duration serverProgressTimeout;
+  final Duration turnSubmitTimeout;
+  final Duration resourceShutdownTimeout;
   final Duration preRollDuration;
   final Duration trailingSpeechPadding;
   final int maxPendingNetworkBytes;
@@ -137,6 +153,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   Future<void> _audioQueue = Future<void>.value();
   Future<void> _microphoneWriteQueue = Future<void>.value();
   Future<void>? _listenInFlight;
+  var _listenInFlightOperation = 0;
   Future<void>? _finishInFlight;
   Future<void>? _endInFlight;
   var _operationGeneration = 0;
@@ -159,13 +176,19 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   String? _clientTurnId;
   String _transcript = '';
   String _response = '';
+  DateTime? _userMessageCreatedAt;
+  DateTime? _assistantMessageCreatedAt;
   Future<void> _shutdownComplete = Future<void>.value();
   Timer? _zeroAudioTimer;
+  Timer? _captureStallTimer;
+  Timer? _speechTurnTimer;
+  Timer? _serverProgressTimer;
   var _capturedBytes = 0;
   var _deliveredBytes = 0;
   var _queuedBytes = 0;
   var _sentBytes = 0;
   final Set<String> _loggedBoundaries = <String>{};
+  final Map<String, Duration> _timingBoundaries = <String, Duration>{};
 
   int get _maximumPreRollBytes =>
       (_captureSampleRateHz *
@@ -240,11 +263,16 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       return false;
     }
     final operation = ++_operationGeneration;
-    final callGeneration = ++_callGeneration;
+    final callGeneration = ++_nextRealtimeCallGeneration;
+    _callGeneration = callGeneration;
+    if (recorder case CallGenerationAwareRealtimeVoiceRecorder binding) {
+      binding.bindCallGeneration(callGeneration);
+    }
     _callActive = true;
     _turnNumber = 0;
     _captureRecoveryAttempt = 0;
     _logTiming('call_start_pressed');
+    _logLifecycle('call_started');
     _emit(
       _state.copyWith(
         phase: VoiceCallPhase.connecting,
@@ -294,7 +322,10 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
               : 'Connecting',
         );
       }
-      return true;
+      return !_disposed &&
+          _callActive &&
+          !_ending &&
+          callGeneration == _callGeneration;
     } on Object catch (error) {
       _debugLog('call_start_failed=${error.runtimeType}');
       await _abortCallStart(
@@ -315,11 +346,10 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _callActive = false;
     ++_operationGeneration;
     if (platformMayBeActive) {
-      try {
-        await activeCallPlatform.endCall(generation: _callGeneration);
-      } on Object {
-        _debugLog('platform_start_rollback_failed');
-      }
+      await _boundedCleanup(
+        'platform_start_rollback',
+        activeCallPlatform.endCall(generation: _callGeneration),
+      );
     }
     _emit(
       _state.copyWith(
@@ -354,7 +384,12 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _callActive = false;
     _ending = true;
     ++_operationGeneration;
+    _cancelWatchdogs();
     _logTiming('call_end_requested');
+    _logLifecycle(
+      fromPlatform ? 'native_end_requested' : 'back_pressed',
+      extra: 'intentional=true',
+    );
     _emit(
       _state.copyWith(
         phase: VoiceCallPhase.ending,
@@ -368,8 +403,12 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     // session_end. Device release starts immediately and in parallel.
     await Future.wait(<Future<void>>[
       _stopTurnResources(cancelRecorder: true),
-      client.disconnect(),
-      if (!fromPlatform) activeCallPlatform.endCall(generation: callGeneration),
+      _boundedCleanup('transport_disconnect', client.disconnect()),
+      if (!fromPlatform)
+        _boundedCleanup(
+          'platform_end',
+          activeCallPlatform.endCall(generation: callGeneration),
+        ),
     ]);
     if (_disposed) return;
     _ending = false;
@@ -385,6 +424,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       ),
     );
     _logTiming('call_ended');
+    _logLifecycle('call_closed', extra: 'intentional=true');
   }
 
   @override
@@ -416,10 +456,16 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         !client.state.canStartTurn) {
       return Future<void>.value();
     }
+    // Reuse only a start that is still current. Recovery invalidates the
+    // operation and re-enters here from inside the failed start; reusing it
+    // would await itself and leave the microphone permanently stopped.
     final existing = _listenInFlight;
-    if (existing != null) return existing;
+    if (existing != null && _listenInFlightOperation == _operationGeneration) {
+      return existing;
+    }
     final operation = _startListening();
     _listenInFlight = operation;
+    _listenInFlightOperation = _operationGeneration;
     return operation.whenComplete(() {
       if (identical(_listenInFlight, operation)) _listenInFlight = null;
     });
@@ -428,13 +474,14 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   Future<void> _startListening() async {
     final token = ++_operationGeneration;
     final callGeneration = _callGeneration;
-    _setActivePhase(VoiceCallPhase.listening, 'Listening');
+    _setActivePhase(VoiceCallPhase.connecting, 'Starting microphone');
     try {
-      await playback.stop();
+      await playback.stop().timeout(resourceShutdownTimeout);
       if (!_currentCall(token, callGeneration)) return;
-      final stream = await recorder.startPcm16Stream();
+      final stream = await recorder.startPcm16Stream().timeout(
+        resourceShutdownTimeout,
+      );
       if (!_currentCall(token, callGeneration)) {
-        await recorder.cancel();
         return;
       }
 
@@ -446,7 +493,10 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       _clientTurnId = null;
       _transcript = '';
       _response = '';
+      _userMessageCreatedAt = null;
+      _assistantMessageCreatedAt = null;
       _loggedBoundaries.clear();
+      _timingBoundaries.clear();
       _capturedBytes = 0;
       _deliveredBytes = 0;
       _queuedBytes = 0;
@@ -487,6 +537,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         },
         cancelOnError: true,
       );
+      _armCaptureStallWatchdog(token);
       _zeroAudioTimer?.cancel();
       _zeroAudioTimer = Timer(zeroAudioTimeout, () {
         if (_currentOperation(token) &&
@@ -505,7 +556,9 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         }
       });
       _captureRecoveryAttempt = 0;
+      _setActivePhase(VoiceCallPhase.listening, 'Listening');
       _logTiming('listening_started');
+      _logLifecycle('mic_started');
       _updatePlatformState('listening');
     } on Object catch (error) {
       if (_currentCall(token, callGeneration)) {
@@ -523,6 +576,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         _zeroAudioTimer?.cancel();
         _zeroAudioTimer = null;
       }
+      _armCaptureStallWatchdog(token);
       final frames = _framer!.add(bytes);
       final observedAt = _monotonicNow();
       final observation = _endpointDetector!.observe(bytes, observedAt);
@@ -557,6 +611,8 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         _turnNumber += 1;
         _clientTurnId = 'client_${_callGeneration}_$_turnNumber';
         _preSpeechBytesSent = _preRollBytes;
+        _armSpeechTurnWatchdog(token);
+        _logLifecycle('speech_started');
         _logTiming(
           'speech_detected',
           extra:
@@ -588,6 +644,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
               'endpoint_timestamp=${observedAt.inMicroseconds} '
               'endpoint_elapsed_since_onset_ms=$endpointElapsedMs',
         );
+        _logLifecycle('speech_ended');
         unawaited(_finalizeUserTurn(token));
       }
     } on Object catch (error) {
@@ -608,10 +665,17 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
 
   void _addTrailingFrame(Uint8List frame) {
     final maximum = _maximumTrailingBytes;
-    if (maximum <= 0 || _trailingBytes + frame.length > maximum) return;
+    if (maximum <= 0) return;
+
     final copy = Uint8List.fromList(frame);
     _trailingFrames.add(copy);
     _trailingBytes += copy.length;
+
+    // Keep the most recent trailing audio rather than filling once and
+    // discarding everything that follows.
+    while (_trailingBytes > maximum && _trailingFrames.isNotEmpty) {
+      _trailingBytes -= _trailingFrames.removeAt(0).length;
+    }
   }
 
   void _flushTrailingFrames(int token) {
@@ -674,18 +738,22 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _finishingMicrophone = true;
     _zeroAudioTimer?.cancel();
     _zeroAudioTimer = null;
+    _captureStallTimer?.cancel();
+    _captureStallTimer = null;
+    _speechTurnTimer?.cancel();
+    _speechTurnTimer = null;
     _setActivePhase(VoiceCallPhase.finalizingUserTurn, 'Thinking');
     _updatePlatformState('finalizing_user_turn');
     try {
-      await recorder.stopStream();
+      await recorder.stopStream().timeout(resourceShutdownTimeout);
       await _microphoneDone?.future.timeout(const Duration(seconds: 2));
       _microphoneActive = false;
-      await _microphoneSubscription?.cancel();
+      await _microphoneSubscription?.cancel().timeout(resourceShutdownTimeout);
       _microphoneSubscription = null;
       final finalFrame = _framer?.flush();
       if (finalFrame != null) _addTrailingFrame(finalFrame);
       _flushTrailingFrames(token);
-      await _microphoneWriteQueue;
+      await _microphoneWriteQueue.timeout(turnSubmitTimeout);
       if (!_currentOperation(token) || !_turnInProgress) return;
       _logTiming(
         'final_pcm_delivered',
@@ -701,11 +769,13 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         return;
       }
       _logTiming('end_of_turn_send_start');
-      if (!await client.endTurnOrdered()) {
+      if (!await client.endTurnOrdered().timeout(turnSubmitTimeout)) {
         await _suspendForReconnect('end_of_turn_send_failed');
         return;
       }
       _logTiming('end_of_turn_send_complete');
+      _logLifecycle('turn_submitted');
+      _armServerProgressWatchdog(token);
       _debugLog(
         'turn_audio captured_bytes=$_capturedBytes '
         'delivered_bytes=$_deliveredBytes queued_bytes=$_queuedBytes '
@@ -836,6 +906,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
           );
         }
       case AanyaRealtimePhase.recovering || AanyaRealtimePhase.offline:
+        _logLifecycle('reconnect_scheduled', extra: 'intentional=false');
         _setActivePhase(VoiceCallPhase.reconnecting, 'Reconnecting');
         _updatePlatformState('reconnecting');
         unawaited(_suspendForReconnect('transport_reconnecting'));
@@ -903,6 +974,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
 
   void _handleEvent(RealtimeServerEvent event) {
     if (_disposed || !_callActive) return;
+    if (_turnInProgress) _armServerProgressWatchdog(_operationGeneration);
     if (event case RealtimeTurnEvent(:final turnId)) {
       if (_turnId == null) {
         _turnId = turnId;
@@ -912,17 +984,30 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     switch (event) {
       case RealtimeSttFinalEvent(:final text):
         _transcript = text;
+        _userMessageCreatedAt ??= _wallClockNow();
         _logTiming('first_text_received', once: true);
         _setActivePhase(VoiceCallPhase.thinking, 'Thinking');
       case RealtimeTextDeltaEvent():
         _response = client.state.responseText;
+        if (_response.trim().isNotEmpty) {
+          _assistantMessageCreatedAt ??= _wallClockNow();
+        }
         _logTiming('first_text_received', once: true);
       case RealtimeTextSentenceEvent(:final text):
         if (_response.isEmpty) _response = text;
+        if (_response.trim().isNotEmpty) {
+          _assistantMessageCreatedAt ??= _wallClockNow();
+        }
         _logTiming('first_text_received', once: true);
       case RealtimeAudioChunkEvent():
         _logTiming('first_audio_metadata_received', once: true);
-      case RealtimeTurnCompleteEvent():
+      case RealtimeTurnCompleteEvent(:final metrics):
+        if (metrics.isNotEmpty) {
+          _debugLog(
+            'server_stage_metrics '
+            '${metrics.entries.map((entry) => '${entry.key}=${entry.value.toStringAsFixed(3)}').join(' ')}',
+          );
+        }
         unawaited(_completeTurn());
       case RealtimeErrorEvent():
         // Client-state handling owns recovery/fatal policy.
@@ -939,6 +1024,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   void _handleAudioFrame(RealtimeAudioFrame frame) {
     if (_disposed || !_callActive || !_turnInProgress || _ending) return;
     final token = _operationGeneration;
+    _armServerProgressWatchdog(token);
     _logTiming('first_audio_bytes_received', once: true);
     _audioQueue = _audioQueue
         .then((_) async {
@@ -957,6 +1043,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
             _setActivePhase(VoiceCallPhase.speaking, 'Speaking');
             _updatePlatformState('speaking');
             _logTiming('playback_started', once: true);
+            _logClientLatencySummary();
           }
         })
         .catchError((Object error) {
@@ -993,6 +1080,9 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
               aiDisclosure:
                   client.state.aiDisclosure ?? 'Aanya is an AI companion.',
               audioUri: Uri(),
+              userCreatedAt: _userMessageCreatedAt ?? _wallClockNow(),
+              assistantCreatedAt:
+                  _assistantMessageCreatedAt ?? _wallClockNow(),
             ),
           ],
         ),
@@ -1021,19 +1111,22 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   }
 
   Future<void> _stopTurnResources({required bool cancelRecorder}) async {
-    _zeroAudioTimer?.cancel();
-    _zeroAudioTimer = null;
+    _cancelWatchdogs();
     _microphoneActive = false;
     _finishingMicrophone = true;
     await Future.wait(<Future<void>>[
       if (cancelRecorder) _safeRecorderCancel(),
       _safePlaybackStop(),
     ]);
-    await _microphoneSubscription?.cancel();
+    await _boundedCleanup(
+      'microphone_subscription_cancel',
+      _microphoneSubscription?.cancel() ?? Future<void>.value(),
+    );
     _microphoneSubscription = null;
   }
 
   void _resetTurnState() {
+    _cancelWatchdogs();
     _turnInProgress = false;
     _microphoneActive = false;
     _finishingMicrophone = false;
@@ -1042,6 +1135,8 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _clientTurnId = null;
     _transcript = '';
     _response = '';
+    _userMessageCreatedAt = null;
+    _assistantMessageCreatedAt = null;
     _preRollFrames.clear();
     _preRollBytes = 0;
     _trailingFrames.clear();
@@ -1055,17 +1150,21 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
 
   Future<void> _safeRecorderCancel() async {
     try {
-      await recorder.cancel();
-    } on Object {
-      _debugLog('recorder_cancel_failed');
+      await recorder.cancel().timeout(resourceShutdownTimeout);
+    } on TimeoutException {
+      _logLifecycle('cleanup_timeout', extra: 'resource=recorder');
+    } on Object catch (error) {
+      _debugLog('recorder_cancel_failed=${error.runtimeType}');
     }
   }
 
   Future<void> _safePlaybackStop() async {
     try {
-      await playback.stop();
-    } on Object {
-      _debugLog('playback_stop_failed');
+      await playback.stop().timeout(resourceShutdownTimeout);
+    } on TimeoutException {
+      _logLifecycle('cleanup_timeout', extra: 'resource=playback');
+    } on Object catch (error) {
+      _debugLog('playback_stop_failed=${error.runtimeType}');
     }
   }
 
@@ -1151,6 +1250,8 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     String? extra,
   }) {
     if (once && !_loggedBoundaries.add(event)) return;
+    final observedAt = monotonicAt ?? _monotonicNow();
+    _timingBoundaries.putIfAbsent(event, () => observedAt);
     final fields = <String>[
       'event=$event',
       'session_id=${client.state.sessionId ?? 'none'}',
@@ -1158,14 +1259,110 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       'client_turn_id=${_clientTurnId ?? 'none'}',
       'generation=$_callGeneration',
       'turn_number=$_turnNumber',
-      'monotonic_us=${(monotonicAt ?? _monotonicNow()).inMicroseconds}',
+      'monotonic_us=${observedAt.inMicroseconds}',
       ?extra,
     ];
     _debugLog(fields.join(' '));
   }
 
+  void _logClientLatencySummary() {
+    double? elapsed(String start, String end) {
+      final from = _timingBoundaries[start];
+      final to = _timingBoundaries[end];
+      if (from == null || to == null) return null;
+      return (to - from).inMicroseconds / 1000;
+    }
+
+    final measured = <String, double?>{
+      'endpoint_to_first_audible_ms': elapsed(
+        'silence_endpoint_fired',
+        'playback_started',
+      ),
+      'end_of_turn_send_ms': elapsed(
+        'end_of_turn_send_start',
+        'end_of_turn_send_complete',
+      ),
+      'playback_prepare_ms': elapsed(
+        'first_audio_bytes_received',
+        'playback_started',
+      ),
+    }..removeWhere((_, value) => value == null);
+    if (measured.isEmpty) return;
+    _debugLog(
+      'client_stage_metrics '
+      '${measured.entries.map((entry) => '${entry.key}=${entry.value!.toStringAsFixed(3)}').join(' ')}',
+    );
+  }
+
   void _debugLog(String message) {
     if (kDebugMode) debugPrint('[AIRA CALL TIMING] $message');
+  }
+
+  void _logLifecycle(String event, {String? extra}) {
+    if (!kDebugMode) return;
+    debugPrint(
+      '[AIRA CALL] event=$event call_id=$_callGeneration '
+      'operation_id=$_operationGeneration ${extra ?? ''}'.trimRight(),
+    );
+  }
+
+  void _armCaptureStallWatchdog(int token) {
+    _captureStallTimer?.cancel();
+    _captureStallTimer = Timer(captureStallTimeout, () {
+      if (!_currentOperation(token) || !_microphoneActive || _ending) return;
+      _logLifecycle('watchdog_fired', extra: 'phase=capture_stall');
+      unawaited(
+        _recoverCapture(
+          token,
+          const RealtimeMicrophoneException(
+            'capture_stalled',
+            'Android microphone PCM stopped making progress.',
+          ),
+        ),
+      );
+    });
+  }
+
+  void _armSpeechTurnWatchdog(int token) {
+    _speechTurnTimer?.cancel();
+    _speechTurnTimer = Timer(maximumSpeechDuration, () {
+      if (!_currentOperation(token) || !_turnInProgress || _ending) return;
+      _logLifecycle('watchdog_fired', extra: 'phase=maximum_speech');
+      _logLifecycle('speech_ended', extra: 'reason=maximum_duration');
+      unawaited(_finalizeUserTurn(token));
+    });
+  }
+
+  void _armServerProgressWatchdog(int token) {
+    _serverProgressTimer?.cancel();
+    _serverProgressTimer = Timer(serverProgressTimeout, () {
+      if (!_currentOperation(token) || !_turnInProgress || _ending) return;
+      _logLifecycle('watchdog_fired', extra: 'phase=server_progress');
+      unawaited(
+        _cancelCurrentTurnAndResume(reason: 'server_progress_timeout'),
+      );
+    });
+  }
+
+  void _cancelWatchdogs() {
+    _zeroAudioTimer?.cancel();
+    _zeroAudioTimer = null;
+    _captureStallTimer?.cancel();
+    _captureStallTimer = null;
+    _speechTurnTimer?.cancel();
+    _speechTurnTimer = null;
+    _serverProgressTimer?.cancel();
+    _serverProgressTimer = null;
+  }
+
+  Future<void> _boundedCleanup(String resource, Future<void> operation) async {
+    try {
+      await operation.timeout(resourceShutdownTimeout);
+    } on TimeoutException {
+      _logLifecycle('cleanup_timeout', extra: 'resource=$resource');
+    } on Object catch (error) {
+      _debugLog('cleanup_failed resource=$resource error=${error.runtimeType}');
+    }
   }
 
   void _emit(VoiceCallState next) {
@@ -1182,6 +1379,8 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _callActive = false;
     _ending = false;
     ++_operationGeneration;
+    _cancelWatchdogs();
+    _logLifecycle('dispose_requested', extra: 'intentional=true');
     client.removeListener(_handleClientState);
     _state = _state.copyWith(
       phase: VoiceCallPhase.disposed,
@@ -1197,21 +1396,34 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   }
 
   Future<void> _shutdown(bool wasActive, int callGeneration) async {
-    _zeroAudioTimer?.cancel();
+    _cancelWatchdogs();
     await Future.wait(<Future<void>>[
       _safeRecorderCancel(),
       _safePlaybackStop(),
       _endPlatformForShutdown(wasActive, callGeneration),
     ]);
-    await _microphoneSubscription?.cancel();
-    await _eventSubscription?.cancel();
-    await _audioSubscription?.cancel();
-    await _platformSubscription?.cancel();
+    await _boundedCleanup(
+      'microphone_subscription_dispose',
+      _microphoneSubscription?.cancel() ?? Future<void>.value(),
+    );
+    await _boundedCleanup(
+      'event_subscription_dispose',
+      _eventSubscription?.cancel() ?? Future<void>.value(),
+    );
+    await _boundedCleanup(
+      'audio_subscription_dispose',
+      _audioSubscription?.cancel() ?? Future<void>.value(),
+    );
+    await _boundedCleanup(
+      'platform_subscription_dispose',
+      _platformSubscription?.cancel() ?? Future<void>.value(),
+    );
     client.dispose();
-    await client.shutdownComplete;
-    await recorder.dispose();
-    await playback.dispose();
-    await activeCallPlatform.dispose();
+    await _boundedCleanup('client_dispose', client.shutdownComplete);
+    await _boundedCleanup('recorder_dispose', recorder.dispose());
+    await _boundedCleanup('playback_dispose', playback.dispose());
+    await _boundedCleanup('platform_dispose', activeCallPlatform.dispose());
+    _logLifecycle('disposed', extra: 'intentional=true');
   }
 
   Future<void> _endPlatformForShutdown(
@@ -1219,10 +1431,9 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     int callGeneration,
   ) async {
     if (!wasActive) return;
-    try {
-      await activeCallPlatform.endCall(generation: callGeneration);
-    } on Object {
-      _debugLog('platform_shutdown_failed');
-    }
+    await _boundedCleanup(
+      'platform_shutdown',
+      activeCallPlatform.endCall(generation: callGeneration),
+    );
   }
 }

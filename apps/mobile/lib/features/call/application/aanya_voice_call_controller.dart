@@ -439,7 +439,11 @@ final class AanyaVoiceCallController extends ChangeNotifier
     );
     final updatedTurns = <ConversationSessionTurn>[
       ..._state.turns,
-      ConversationSessionTurn.fromResponse(response),
+      ConversationSessionTurn.fromResponse(
+        response,
+        userCreatedAt: recordingStoppedAt,
+        assistantCreatedAt: responseReceivedAt,
+      ),
     ];
     _emit(
       _state.copyWith(

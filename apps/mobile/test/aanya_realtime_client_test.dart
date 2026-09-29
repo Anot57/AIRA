@@ -494,6 +494,41 @@ void main() {
     expect(client.state.sessionId, 'session-2');
   });
 
+  test('intentional disconnect invalidates a pending reconnect delay', () async {
+    final first = _FakeSocket();
+    final second = _FakeSocket();
+    final connector = _FakeConnector()
+      ..sockets.addAll(<_FakeSocket>[first, second]);
+    final reconnectStarted = Completer<void>();
+    final reconnectGate = Completer<void>();
+    final client = _client(
+      connector,
+      reconnectDelays: const <Duration>[Duration.zero],
+      reconnectDelay: (_) async {
+        if (!reconnectStarted.isCompleted) reconnectStarted.complete();
+        await reconnectGate.future;
+      },
+    );
+    addTearDown(() async {
+      if (!reconnectGate.isCompleted) reconnectGate.complete();
+      client.dispose();
+      await client.shutdownComplete;
+    });
+    await client.connect();
+    first.sendServerJson(_sessionReady());
+    await _flushEvents();
+
+    await first.disconnectFromServer();
+    await reconnectStarted.future.timeout(const Duration(seconds: 1));
+    await client.disconnect();
+    reconnectGate.complete();
+    await _flushEvents(10);
+
+    expect(connector.connectCount, 1);
+    expect(client.state.phase, AanyaRealtimePhase.offline);
+    expect(_sentTypes(second), isEmpty);
+  });
+
   test('background visibility changes preserve the active socket and turn', () async {
     final first = _FakeSocket();
     final second = _FakeSocket();

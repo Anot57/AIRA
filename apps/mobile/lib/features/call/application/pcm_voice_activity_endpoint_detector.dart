@@ -22,8 +22,14 @@ final class PcmVoiceActivityConfig {
     this.speechOnRms = 650,
     this.speechOffRms = 400,
     this.minimumSpeechFrames = 3,
+    this.minimumSpeechDuration = const Duration(milliseconds: 80),
+    this.maximumStationaryCandidateDuration = const Duration(
+      milliseconds: 280,
+    ),
+    this.minimumOnsetModulation = 0.10,
     this.noiseMultiplier = 2.2,
-    this.maximumAdaptiveSpeechOnRms = 1800,
+    this.continuationNoiseMultiplier = 1.35,
+    this.maximumAdaptiveSpeechOnRms = 5000,
   });
 
   final Duration silenceEndpoint;
@@ -34,7 +40,11 @@ final class PcmVoiceActivityConfig {
   /// Lower threshold used after onset, providing energy hysteresis.
   final double speechOffRms;
   final int minimumSpeechFrames;
+  final Duration minimumSpeechDuration;
+  final Duration maximumStationaryCandidateDuration;
+  final double minimumOnsetModulation;
   final double noiseMultiplier;
+  final double continuationNoiseMultiplier;
   final double maximumAdaptiveSpeechOnRms;
 
   void validate() {
@@ -43,7 +53,12 @@ final class PcmVoiceActivityConfig {
         speechOffRms <= 0 ||
         speechOffRms >= speechOnRms ||
         minimumSpeechFrames <= 0 ||
+        minimumSpeechDuration <= Duration.zero ||
+        maximumStationaryCandidateDuration < minimumSpeechDuration ||
+        minimumOnsetModulation <= 0 ||
         noiseMultiplier <= 1 ||
+        continuationNoiseMultiplier <= 1 ||
+        continuationNoiseMultiplier >= noiseMultiplier ||
         maximumAdaptiveSpeechOnRms < speechOnRms) {
       throw ArgumentError('Voice endpoint thresholds are invalid.');
     }
@@ -92,6 +107,8 @@ final class PcmVoiceActivityEndpointDetector {
   Duration? _speechOnset;
   Duration? _lastSpeech;
   var _candidateFrames = 0;
+  Duration? _candidateStartedAt;
+  final List<double> _candidateRms = <double>[];
   var _noiseFloorRms = 120.0;
   var _endpointEmitted = false;
 
@@ -121,6 +138,10 @@ final class PcmVoiceActivityEndpointDetector {
       config.maximumAdaptiveSpeechOnRms,
       math.max(config.speechOnRms, _noiseFloorRms * config.noiseMultiplier),
     );
+    final adaptiveOff = math.max(
+      config.speechOffRms,
+      math.min(adaptiveOn, _noiseFloorRms * config.continuationNoiseMultiplier),
+    );
     var speechStarted = false;
     var endpointReached = false;
 
@@ -128,21 +149,37 @@ final class PcmVoiceActivityEndpointDetector {
       case PcmVoiceActivityState.waitingForSpeech:
       case PcmVoiceActivityState.speechCandidate:
         if (rms >= adaptiveOn) {
+          _candidateStartedAt ??= monotonicTimestamp;
           _candidateFrames += 1;
+          _candidateRms.add(rms);
           _state = PcmVoiceActivityState.speechCandidate;
-          if (_candidateFrames >= config.minimumSpeechFrames) {
-            _speechOnset = monotonicTimestamp;
+          final candidateDuration = monotonicTimestamp - _candidateStartedAt!;
+          if (_candidateFrames >= config.minimumSpeechFrames &&
+              candidateDuration >= config.minimumSpeechDuration &&
+              _candidateHasSpeechModulation()) {
+            _speechOnset = _candidateStartedAt;
             _lastSpeech = monotonicTimestamp;
             _state = PcmVoiceActivityState.speechActive;
             speechStarted = true;
+          } else if (candidateDuration >=
+              config.maximumStationaryCandidateDuration) {
+            // A steady fan or electrical hum can sit above the initial floor.
+            // Fold a stationary candidate into the ambient estimate instead
+            // of allowing it to become a conversation turn.
+            _learnNoise(
+              _candidateRms.reduce((a, b) => a + b) / _candidateRms.length,
+              weight: 0.35,
+            );
+            _clearCandidate();
+            _state = PcmVoiceActivityState.waitingForSpeech;
           }
         } else {
-          _candidateFrames = 0;
+          _clearCandidate();
           _state = PcmVoiceActivityState.waitingForSpeech;
           _learnNoise(rms);
         }
       case PcmVoiceActivityState.speechActive:
-        if (rms >= config.speechOffRms) {
+        if (rms >= adaptiveOff) {
           _lastSpeech = monotonicTimestamp;
         } else {
           _state = PcmVoiceActivityState.possibleEndpoint;
@@ -157,7 +194,10 @@ final class PcmVoiceActivityEndpointDetector {
           }
         }
       case PcmVoiceActivityState.possibleEndpoint:
-        if (rms >= adaptiveOn) {
+        // Once speech has already started, use the lower continuation
+        // threshold to detect resumed/continued speech. Requiring adaptiveOn
+        // here can lose quiet words after a natural pause.
+        if (rms >= adaptiveOff) {
           _lastSpeech = monotonicTimestamp;
           _state = PcmVoiceActivityState.speechActive;
         } else {
@@ -186,10 +226,24 @@ final class PcmVoiceActivityEndpointDetector {
     );
   }
 
-  void _learnNoise(double rms) {
+  bool _candidateHasSpeechModulation() {
+    if (_candidateRms.isEmpty) return false;
+    final lowest = _candidateRms.reduce(math.min);
+    final highest = _candidateRms.reduce(math.max);
+    final mean = _candidateRms.reduce((a, b) => a + b) / _candidateRms.length;
+    return mean > 0 && (highest - lowest) / mean >= config.minimumOnsetModulation;
+  }
+
+  void _clearCandidate() {
+    _candidateFrames = 0;
+    _candidateStartedAt = null;
+    _candidateRms.clear();
+  }
+
+  void _learnNoise(double rms, {double weight = 0.06}) {
     // Slow enough not to chase a sudden voice transient, fast enough to adapt
     // to a stable fan/room floor before speech begins.
-    _noiseFloorRms = (_noiseFloorRms * 0.94) + (rms * 0.06);
+    _noiseFloorRms = (_noiseFloorRms * (1 - weight)) + (rms * weight);
   }
 
   void reset() {
@@ -197,7 +251,7 @@ final class PcmVoiceActivityEndpointDetector {
     _lastTimestamp = null;
     _speechOnset = null;
     _lastSpeech = null;
-    _candidateFrames = 0;
+    _clearCandidate();
     _endpointEmitted = false;
     _noiseFloorRms = 120;
   }

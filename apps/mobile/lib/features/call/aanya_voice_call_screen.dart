@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
+import '../../core/time/ist_timestamp_formatter.dart';
 import 'package:http/http.dart' as http;
 
 import '../../core/config/aira_api_config.dart';
@@ -451,6 +453,7 @@ class _ConversationHistory extends StatelessWidget {
                 key: ValueKey('turn-user-${turn.turnId}'),
                 speaker: 'You',
                 message: turn.userTranscript,
+                createdAt: turn.userCreatedAt,
                 alignRight: true,
               ),
               const SizedBox(height: AppSpacing.sm),
@@ -458,6 +461,7 @@ class _ConversationHistory extends StatelessWidget {
                 key: ValueKey('turn-aanya-${turn.turnId}'),
                 speaker: 'Aanya',
                 message: turn.assistantResponse,
+                createdAt: turn.assistantCreatedAt,
                 alignRight: false,
               ),
             ],
@@ -473,11 +477,13 @@ class _MessageBubble extends StatelessWidget {
     super.key,
     required this.speaker,
     required this.message,
+    required this.createdAt,
     required this.alignRight,
   });
 
   final String speaker;
   final String message;
+  final DateTime createdAt;
   final bool alignRight;
 
   @override
@@ -507,6 +513,17 @@ class _MessageBubble extends StatelessWidget {
                         ? colors.onPrimaryContainer
                         : colors.primary,
                     fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.xxs),
+                Text(
+                  IstTimestampFormatter.format(createdAt),
+                  key: ValueKey('message-timestamp-${key.toString()}'),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: alignRight
+                        ? colors.onPrimaryContainer
+                        : colors.onSurfaceVariant,
+                    fontFeatures: const [FontFeature.tabularFigures()],
                   ),
                 ),
                 const SizedBox(height: AppSpacing.xxs),

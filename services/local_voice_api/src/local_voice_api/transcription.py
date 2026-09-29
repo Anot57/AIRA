@@ -18,7 +18,9 @@ from typing import Any
 
 from .observability import current_turn_timing
 
-MODEL_NAME = "base.en"
+MODEL_NAME = (
+    os.environ.get("AIRA_STT_MODEL", "base.en").strip() or "base.en"
+)
 DEVICE = os.environ.get("AIRA_STT_DEVICE", "cpu").strip().lower() or "cpu"
 COMPUTE_TYPE = (
     os.environ.get("AIRA_STT_COMPUTE_TYPE", "int8").strip().lower() or "int8"
@@ -26,7 +28,9 @@ COMPUTE_TYPE = (
 DEFAULT_CPU_THREADS = 6
 NUM_WORKERS = 1
 LANGUAGE = "en"
-BEAM_SIZE = 1
+BEAM_SIZE = int(
+    os.environ.get("AIRA_STT_BEAM_SIZE", "1").strip() or "1"
+)
 VAD_FILTER = True
 CONDITION_ON_PREVIOUS_TEXT = False
 DEFAULT_MODEL_DIR = Path("/mnt/e/aira-local-runtime/models/faster-whisper")

@@ -246,6 +246,9 @@ class PersonaAndLlamaCommandTests(unittest.TestCase):
         self.assertIn("unless the user explicitly asks", persona)
         self.assertIn("do not begin every response with a greeting", persona)
         self.assertIn("respond directly to the user's latest words", persona)
+        self.assertIn("what can i do for you", persona)
+        self.assertIn("i am here to help", persona)
+        self.assertIn("what do you need help with", persona)
 
     def test_name_question_explicitly_allows_a_truthful_aanya_answer(self) -> None:
         persona = get_companion_persona("aanya").casefold()
@@ -263,6 +266,30 @@ class PersonaAndLlamaCommandTests(unittest.TestCase):
             "you are an ai, not a human",
             persona,
         )
+
+    def test_name_introduction_does_not_encourage_parroting(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn("nice to meet you, aman", persona)
+        self.assertIn(
+            "never repeat their introduction as if it were your own identity",
+            persona,
+        )
+
+    def test_surprise_reactions_are_limited_to_surprising_context(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn("reserve 'really?' and 'wait, seriously?'", persona)
+        self.assertIn("never use either as a generic answer", persona)
+        self.assertIn("neutral information request", persona)
+
+    def test_affection_guidance_is_warm_but_non_dependent(self) -> None:
+        persona = get_companion_persona("aanya").casefold()
+
+        self.assertIn("if the user says 'i love you'", persona)
+        self.assertIn("respond warmly in your own words", persona)
+        self.assertIn("care about you too", persona)
+        self.assertIn("without claiming to be human, exclusive", persona)
 
     def test_llama_command_is_offline_non_thinking_and_prompt_clean(self) -> None:
         llama_path = Path("/mnt/e/aira-local-runtime/llama/llama-cli")
