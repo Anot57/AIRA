@@ -67,7 +67,9 @@ final class AndroidPcmVoiceRecorder
   }
 
   @override
-  Future<Stream<Uint8List>> startPcm16Stream() async {
+  Future<Stream<Uint8List>> startPcm16Stream({
+    bool echoCancellation = false,
+  }) async {
     await _closeInFlight;
     if (_disposed) throw StateError('Native microphone recorder is disposed.');
     if (_turnController != null) {
@@ -94,7 +96,10 @@ final class AndroidPcmVoiceRecorder
     try {
       final result = await _methodChannel.invokeMapMethod<String, Object?>(
         'start',
-        <String, Object?>{'callGeneration': callGeneration},
+        <String, Object?>{
+          'callGeneration': callGeneration,
+          'echoCancellation': echoCancellation,
+        },
       ).timeout(platformOperationTimeout);
       _updateSnapshot(result);
       return controller.stream;

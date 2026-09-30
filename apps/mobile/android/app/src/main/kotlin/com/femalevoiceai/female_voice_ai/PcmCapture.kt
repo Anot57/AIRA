@@ -5,6 +5,9 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -59,6 +62,9 @@ internal class PcmCapture(
     private var capturedFrames = 0L
     private var audioSource: String? = null
     private var disposed = false
+    private var echoCancellationRequested = false
+    private var echoCancellerActive = false
+    private var captureEffects = listOf<AudioEffect>()
 
     fun attach(newMessenger: BinaryMessenger) {
         synchronized(lock) {
@@ -115,6 +121,7 @@ internal class PcmCapture(
 
     private fun start(call: MethodCall, result: MethodChannel.Result) {
         val callGeneration = call.argument<Int>("callGeneration")
+        val echoCancellation = call.argument<Boolean>("echoCancellation") ?: false
         if (callGeneration == null || !AanyaCallRuntime.isCurrent(callGeneration)) {
             result.error("stale_call_generation", "The AI call generation is no longer active.", snapshot())
             return
@@ -146,6 +153,8 @@ internal class PcmCapture(
             capturedFrames = 0
             audioSource = null
             stopReason = null
+            echoCancellationRequested = echoCancellation
+            echoCancellerActive = false
             token = generation.incrementAndGet()
         }
         emitState()
@@ -204,10 +213,25 @@ internal class PcmCapture(
         try {
             synchronized(lock) { state = State.STARTING }
             emitState()
-            active = createAndStartRecorder(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-            if (active != null) {
-                synchronized(lock) { audioSource = "voice_recognition" }
-            } else {
+            val wantsEchoCancellation = synchronized(lock) { echoCancellationRequested }
+            if (wantsEchoCancellation) {
+                // The platform's call-audio path, which applies echo
+                // cancellation against what the device is playing.
+                active = createAndStartRecorder(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                if (active != null) {
+                    val effects = attachCaptureEffects(active.audioSessionId)
+                    synchronized(lock) {
+                        audioSource = "voice_communication"
+                        captureEffects = effects
+                        echoCancellerActive = effects.any { it is AcousticEchoCanceler }
+                    }
+                }
+            }
+            if (active == null) {
+                active = createAndStartRecorder(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                if (active != null) synchronized(lock) { audioSource = "voice_recognition" }
+            }
+            if (active == null) {
                 active = createAndStartRecorder(MediaRecorder.AudioSource.MIC)
                 if (active != null) synchronized(lock) { audioSource = "mic" }
             }
@@ -215,6 +239,7 @@ internal class PcmCapture(
             synchronized(lock) {
                 if (disposed || token != generation.get()) {
                     active.stop()
+                    releaseCaptureEffectsLocked()
                     active.release()
                     state = if (disposed) State.RELEASED else State.STOPPED
                     replySuccess(result, snapshot())
@@ -236,6 +261,7 @@ internal class PcmCapture(
         } catch (error: Throwable) {
             try { active?.release() } catch (_: Throwable) {}
             synchronized(lock) {
+                releaseCaptureEffectsLocked()
                 recorder = null
                 state = if (disposed) State.RELEASED else State.ERROR
                 stopReason = "capture_start_failed"
@@ -244,6 +270,41 @@ internal class PcmCapture(
             replyError(result, "capture_start_failed", error)
             completeStopReplies()
         }
+    }
+
+    private fun attachCaptureEffects(audioSessionId: Int): List<AudioEffect> {
+        val effects = mutableListOf<AudioEffect>()
+        if (AcousticEchoCanceler.isAvailable()) {
+            try {
+                AcousticEchoCanceler.create(audioSessionId)?.let {
+                    it.enabled = true
+                    effects += it
+                }
+            } catch (_: Throwable) {}
+        }
+        if (NoiseSuppressor.isAvailable()) {
+            try {
+                NoiseSuppressor.create(audioSessionId)?.let {
+                    it.enabled = true
+                    effects += it
+                }
+            } catch (_: Throwable) {}
+        }
+        Log.i(
+            TAG,
+            "event=capture_effects aec=${effects.any { it is AcousticEchoCanceler }} " +
+                "ns=${effects.any { it is NoiseSuppressor }}",
+        )
+        return effects
+    }
+
+    // Caller holds [lock].
+    private fun releaseCaptureEffectsLocked() {
+        for (effect in captureEffects) {
+            try { effect.release() } catch (_: Throwable) {}
+        }
+        captureEffects = listOf()
+        echoCancellerActive = false
     }
 
     @SuppressLint("MissingPermission")
@@ -331,6 +392,7 @@ internal class PcmCapture(
             }
         } finally {
             try { active.stop() } catch (_: Throwable) {}
+            synchronized(lock) { releaseCaptureEffectsLocked() }
             active.release()
             synchronized(lock) {
                 if (recorder === active) recorder = null
@@ -425,6 +487,8 @@ internal class PcmCapture(
             "capturedBytes" to capturedBytes,
             "capturedFrames" to capturedFrames,
             "audioSource" to audioSource,
+            "echoCancellationRequested" to echoCancellationRequested,
+            "echoCancellerActive" to echoCancellerActive,
             "stopReason" to stopReason,
             "callGeneration" to AanyaCallRuntime.generation,
             "monotonicNanos" to SystemClock.elapsedRealtimeNanos(),

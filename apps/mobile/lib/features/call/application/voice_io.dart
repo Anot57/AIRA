@@ -101,7 +101,10 @@ abstract interface class RealtimeVoiceRecorder {
   /// Warms the channel/format path without opening the microphone.
   Future<void> prepare() async {}
 
-  Future<Stream<Uint8List>> startPcm16Stream();
+  /// [echoCancellation] asks the platform for its voice-communication capture
+  /// path with acoustic echo cancellation, needed when the microphone stays
+  /// open while the companion is speaking.
+  Future<Stream<Uint8List>> startPcm16Stream({bool echoCancellation = false});
 
   Future<void> stopStream();
 

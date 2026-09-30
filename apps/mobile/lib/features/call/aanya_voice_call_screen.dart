@@ -58,6 +58,9 @@ class AanyaVoiceCallScreen extends StatefulWidget {
         recorder: AndroidPcmVoiceRecorder(),
         playback: AndroidPcmVoicePlayback(),
         activeCallPlatform: AndroidActiveCallService(),
+        // Build with --dart-define=AIRA_BARGE_IN=true to test talking over
+        // Aanya; off until echo cancellation is verified on the phone.
+        bargeInEnabled: const bool.fromEnvironment('AIRA_BARGE_IN'),
       ),
     );
   }

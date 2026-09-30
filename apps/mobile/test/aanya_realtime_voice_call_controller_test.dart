@@ -633,6 +633,111 @@ void main() {
     expect(harness.recorder.startCount, 2);
   });
 
+  test('barge-in is off by default: the mic stays closed while Aanya speaks', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'Hello'))
+      ..sendJson(_turn('text_delta', delta: 'Hello there.'))
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[1, 0, 2, 0]);
+    await _flush();
+
+    expect(harness.controller.state.phase, VoiceCallPhase.speaking);
+    expect(harness.recorder.startCount, 1);
+    expect(harness.recorder.echoCancellationRequests, <bool>[false]);
+  });
+
+  test('barge-in: talking over Aanya interrupts her and starts a new turn', () async {
+    final harness = _Harness(bargeInEnabled: true);
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    await _flush(12);
+    // The monitor reopens the mic, with echo cancellation, once the turn is sent.
+    expect(harness.recorder.startCount, 2);
+    expect(harness.recorder.echoCancellationRequests, <bool>[true, true]);
+
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'Tell me a story'))
+      ..sendJson(_turn('text_delta', delta: 'Once upon a time.'))
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[1, 0, 2, 0]);
+    await _flush();
+    expect(harness.controller.state.phase, VoiceCallPhase.speaking);
+    final stopsBefore = harness.playback.stopCount;
+
+    for (final amplitude in _bargeInSpeech) {
+      harness.addPcm(
+        _pcm(amplitude: amplitude),
+        advance: const Duration(milliseconds: 40),
+      );
+    }
+    await _flush();
+
+    expect(_sentTypes(harness.socket), contains('cancel_turn'));
+    expect(harness.playback.stopCount, greaterThan(stopsBefore));
+    harness.socket.sendJson(_cancelled(turnId: 'turn-1'));
+    await _flush(12);
+
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+    expect(harness.recorder.startCount, 3);
+    // The interrupting words carry into the new turn once speech is confirmed.
+    final sentBefore = harness.socket.sentBinary.length;
+    harness.confirmSpeech();
+    await _flush();
+    final newTurnFrames = harness.socket.sentBinary.skip(sentBefore).toList();
+    expect(newTurnFrames, anyElement(equals(_pcm(amplitude: 6200))));
+  });
+
+  test('barge-in ignores quiet speaker leakage while Aanya speaks', () async {
+    final harness = _Harness(bargeInEnabled: true);
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    await _flush(12);
+    harness.socket
+      ..sendJson(_turn('stt_final', text: 'Tell me a story'))
+      ..sendJson(_turn('text_delta', delta: 'Once upon a time.'))
+      ..sendJson(_audioHeader())
+      ..sendServerBinary(<int>[1, 0, 2, 0]);
+    await _flush();
+
+    for (var frame = 0; frame < 25; frame += 1) {
+      harness.addPcm(
+        _pcm(amplitude: frame.isEven ? 900 : 1100),
+        advance: const Duration(milliseconds: 40),
+      );
+    }
+    await _flush();
+
+    expect(_sentTypes(harness.socket), isNot(contains('cancel_turn')));
+    expect(harness.controller.state.phase, VoiceCallPhase.speaking);
+  });
+
+  test('barge-in monitor closes before listening resumes after a turn', () async {
+    final harness = _Harness(bargeInEnabled: true);
+    addTearDown(harness.dispose);
+    await harness.initialize();
+    await harness.startCall();
+    await harness.endpointUserSpeech();
+    await _flush(12);
+    final cancelsBefore = harness.recorder.cancelCount;
+
+    harness.completeServerTurn('turn-1');
+    await _flush(12);
+
+    expect(harness.recorder.cancelCount, greaterThan(cancelsBefore));
+    expect(harness.recorder.startCount, 3);
+    expect(harness.controller.state.phase, VoiceCallPhase.listening);
+    expect(_sentTypes(harness.socket), isNot(contains('cancel_turn')));
+  });
+
   test('crisis escalation stays visible until dismissed or a new call', () async {
     final harness = _Harness();
     addTearDown(harness.dispose);
@@ -707,6 +812,7 @@ final class _Harness {
     Duration maximumSpeechDuration = const Duration(seconds: 30),
     Duration serverProgressTimeout = const Duration(seconds: 30),
     Duration resourceShutdownTimeout = const Duration(seconds: 3),
+    bool bargeInEnabled = false,
   }) {
     sockets = List<_FakeSocket>.generate(
       extraSockets + 1,
@@ -735,6 +841,7 @@ final class _Harness {
       maximumSpeechDuration: maximumSpeechDuration,
       serverProgressTimeout: serverProgressTimeout,
       resourceShutdownTimeout: resourceShutdownTimeout,
+      bargeInEnabled: bargeInEnabled,
     );
   }
 
@@ -835,9 +942,14 @@ final class _FakeRecorder
     prepareCount += 1;
   }
 
+  final List<bool> echoCancellationRequests = <bool>[];
+
   @override
-  Future<Stream<Uint8List>> startPcm16Stream() async {
+  Future<Stream<Uint8List>> startPcm16Stream({
+    bool echoCancellation = false,
+  }) async {
     startCount += 1;
+    echoCancellationRequests.add(echoCancellation);
     if (startFailures > 0) {
       startFailures -= 1;
       throw const RealtimeMicrophoneException(
@@ -1036,6 +1148,10 @@ final class _FakeSocket implements RealtimeWebSocket {
 }
 
 final Uint8List _quietPcm = _pcm(amplitude: 0);
+// Loud, modulated speech held long enough for the stricter barge-in detector.
+const List<int> _bargeInSpeech = <int>[
+  4200, 5800, 5000, 6200, 4800, 5600, 5200, 6000, 4600, 5800, 5000, 6200,
+];
 final Uint8List _voicePcm = _pcm(amplitude: 5000);
 
 Uint8List _pcm({required int amplitude, int samples = 640}) {

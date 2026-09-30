@@ -82,6 +82,8 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     required this.playback,
     ActiveCallPlatform? activeCallPlatform,
     this.endpointConfig = const PcmVoiceActivityConfig(),
+    this.bargeInEnabled = false,
+    this.bargeInConfig = defaultBargeInConfig,
     this.zeroAudioTimeout = const Duration(milliseconds: 950),
     this.captureStallTimeout = const Duration(seconds: 3),
     this.maximumSpeechDuration = const Duration(seconds: 45),
@@ -103,6 +105,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       throw ArgumentError.value(companionId, 'companionId');
     }
     endpointConfig.validate();
+    bargeInConfig.validate();
     if (zeroAudioTimeout <= Duration.zero ||
         captureStallTimeout <= Duration.zero ||
         maximumSpeechDuration <= Duration.zero ||
@@ -124,6 +127,26 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   final RealtimeVoicePlayback playback;
   final ActiveCallPlatform activeCallPlatform;
   final PcmVoiceActivityConfig endpointConfig;
+
+  /// Voice barge-in: keep the microphone open (with platform echo
+  /// cancellation) while the companion thinks and speaks, and interrupt her
+  /// when the user talks over her. Off by default because without working
+  /// echo cancellation her own speaker audio could interrupt her; enable it
+  /// only after verifying echo behaviour on the target phone.
+  final bool bargeInEnabled;
+
+  /// Stricter than [endpointConfig] so residual speaker leakage is ignored.
+  final PcmVoiceActivityConfig bargeInConfig;
+
+  static const PcmVoiceActivityConfig defaultBargeInConfig =
+      PcmVoiceActivityConfig(
+        speechOnRms: 1800,
+        speechOffRms: 1200,
+        minimumSpeechFrames: 8,
+        minimumSpeechDuration: Duration(milliseconds: 320),
+        maximumStationaryCandidateDuration: Duration(milliseconds: 480),
+        noiseMultiplier: 3,
+      );
   final Duration zeroAudioTimeout;
   final Duration captureStallTimeout;
   final Duration maximumSpeechDuration;
@@ -145,6 +168,14 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
   StreamSubscription<RealtimeAudioFrame>? _audioSubscription;
   StreamSubscription<ActiveCallPlatformEvent>? _platformSubscription;
   StreamSubscription<Uint8List>? _microphoneSubscription;
+  StreamSubscription<Uint8List>? _bargeInSubscription;
+  PcmVoiceActivityEndpointDetector? _bargeInDetector;
+  Pcm16FrameFramer? _bargeInFramer;
+  final List<Uint8List> _bargeInFrames = <Uint8List>[];
+  var _bargeInBytes = 0;
+  var _bargeInTriggered = false;
+  Future<void>? _bargeInStart;
+  final List<Uint8List> _pendingBargeInPreRoll = <Uint8List>[];
   Completer<void>? _microphoneDone;
   Pcm16FrameFramer? _framer;
   PcmVoiceActivityEndpointDetector? _endpointDetector;
@@ -270,6 +301,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     }
     _callActive = true;
     _turnNumber = 0;
+    _pendingBargeInPreRoll.clear();
     _captureRecoveryAttempt = 0;
     _logTiming('call_start_pressed');
     _logLifecycle('call_started');
@@ -479,9 +511,9 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     try {
       await playback.stop().timeout(resourceShutdownTimeout);
       if (!_currentCall(token, callGeneration)) return;
-      final stream = await recorder.startPcm16Stream().timeout(
-        resourceShutdownTimeout,
-      );
+      final stream = await recorder
+          .startPcm16Stream(echoCancellation: bargeInEnabled)
+          .timeout(resourceShutdownTimeout);
       if (!_currentCall(token, callGeneration)) {
         return;
       }
@@ -504,6 +536,11 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       _sentBytes = 0;
       _preRollBytes = 0;
       _preRollFrames.clear();
+      // Words spoken over the companion belong to this new turn.
+      for (final frame in _pendingBargeInPreRoll) {
+        _addPreRoll(frame);
+      }
+      _pendingBargeInPreRoll.clear();
       _trailingBytes = 0;
       _trailingFrames.clear();
       _preSpeechBytesSent = 0;
@@ -653,6 +690,87 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     }
   }
 
+  Future<void> _startBargeInMonitor(int token) async {
+    if (!_currentOperation(token) || !_turnInProgress || !_callActive) return;
+    try {
+      final stream = await recorder
+          .startPcm16Stream(echoCancellation: true)
+          .timeout(resourceShutdownTimeout);
+      if (!_currentOperation(token) || !_turnInProgress || _ending) {
+        await _safeRecorderCancel();
+        return;
+      }
+      _bargeInFramer = Pcm16FrameFramer();
+      _bargeInDetector = PcmVoiceActivityEndpointDetector(
+        config: bargeInConfig,
+      );
+      _bargeInFrames.clear();
+      _bargeInBytes = 0;
+      _bargeInSubscription = stream.listen(
+        (bytes) => _handleBargeInBytes(token, bytes),
+        // Barge-in is best effort: a failed monitor never affects the turn.
+        onError: (Object error, StackTrace stack) {
+          _debugLog('barge_in_monitor_error=${error.runtimeType}');
+        },
+        cancelOnError: true,
+      );
+      _logLifecycle('barge_in_monitor_started');
+    } on Object catch (error) {
+      _debugLog('barge_in_monitor_failed=${error.runtimeType}');
+    }
+  }
+
+  void _handleBargeInBytes(int token, Uint8List bytes) {
+    if (!_currentOperation(token) ||
+        !_turnInProgress ||
+        _bargeInTriggered ||
+        _ending) {
+      return;
+    }
+    final framer = _bargeInFramer;
+    final detector = _bargeInDetector;
+    if (framer == null || detector == null) return;
+    final maximum = _maximumPreRollBytes;
+    for (final frame in framer.add(bytes)) {
+      final copy = Uint8List.fromList(frame);
+      _bargeInFrames.add(copy);
+      _bargeInBytes += copy.length;
+      while (_bargeInBytes > maximum && _bargeInFrames.isNotEmpty) {
+        _bargeInBytes -= _bargeInFrames.removeAt(0).length;
+      }
+    }
+    final observation = detector.observe(bytes, _monotonicNow());
+    if (!observation.speechStarted) return;
+    _bargeInTriggered = true;
+    _pendingBargeInPreRoll
+      ..clear()
+      ..addAll(_bargeInFrames);
+    _logLifecycle(
+      'barge_in_detected',
+      extra: 'rms=${observation.rms.toStringAsFixed(2)}',
+    );
+    unawaited(_cancelCurrentTurnAndResume(reason: 'barge_in'));
+  }
+
+  Future<void> _stopBargeInMonitor() async {
+    // A monitor still starting would otherwise claim the recorder after the
+    // next listening stream has started.
+    final starting = _bargeInStart;
+    _bargeInStart = null;
+    if (starting != null) {
+      await _boundedCleanup('barge_in_monitor_start', starting);
+    }
+    final subscription = _bargeInSubscription;
+    if (subscription == null) return;
+    _bargeInSubscription = null;
+    _bargeInFramer = null;
+    _bargeInDetector = null;
+    _bargeInFrames.clear();
+    _bargeInBytes = 0;
+    await _safeRecorderCancel();
+    await _boundedCleanup('barge_in_monitor_cancel', subscription.cancel());
+  }
+
   void _addPreRoll(Uint8List frame) {
     final maximum = _maximumPreRollBytes;
     if (maximum <= 0) return;
@@ -777,6 +895,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       _logTiming('end_of_turn_send_complete');
       _logLifecycle('turn_submitted');
       _armServerProgressWatchdog(token);
+      if (bargeInEnabled) _bargeInStart = _startBargeInMonitor(token);
       _debugLog(
         'turn_audio captured_bytes=$_capturedBytes '
         'delivered_bytes=$_deliveredBytes queued_bytes=$_queuedBytes '
@@ -1092,6 +1211,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
         ),
       );
     }
+    await _stopBargeInMonitor();
     _resetTurnState();
     // AudioTrack drain above is authoritative. Only now may capture restart,
     // preventing Aanya's own speaker output becoming the next user turn.
@@ -1116,6 +1236,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
 
   Future<void> _stopTurnResources({required bool cancelRecorder}) async {
     _cancelWatchdogs();
+    await _stopBargeInMonitor();
     _microphoneActive = false;
     _finishingMicrophone = true;
     await Future.wait(<Future<void>>[
@@ -1150,6 +1271,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
     _endpointDetector = null;
     _audioQueue = Future<void>.value();
     _finishInFlight = null;
+    _bargeInTriggered = false;
   }
 
   Future<void> _safeRecorderCancel() async {
@@ -1414,6 +1536,10 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
       _safePlaybackStop(),
       _endPlatformForShutdown(wasActive, callGeneration),
     ]);
+    await _boundedCleanup(
+      'barge_in_subscription_dispose',
+      _bargeInSubscription?.cancel() ?? Future<void>.value(),
+    );
     await _boundedCleanup(
       'microphone_subscription_dispose',
       _microphoneSubscription?.cancel() ?? Future<void>.value(),
