@@ -124,6 +124,11 @@ class _ImmediateProcessor:
         self.closed = True
 
 
+# The server's designed worst-case cleanup is 0.25 s (cancel wait) + 0.5 s
+# (close timeout); allow ample scheduling slack on a loaded machine.
+_CLEANUP_WAIT_SECONDS = 5
+
+
 class _BlockingProcessor:
     def __init__(self) -> None:
         self.started = threading.Event()
@@ -605,8 +610,8 @@ class RealtimeServerTests(unittest.TestCase):
                 self.assertEqual("turn_cancelled", websocket.receive_json()["code"])
                 websocket.send_json(_control("session_end"))
 
-        self.assertTrue(processor.cancel_called.wait(timeout=1))
-        self.assertTrue(processor.close_called.wait(timeout=1))
+        self.assertTrue(processor.cancel_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
+        self.assertTrue(processor.close_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 
@@ -630,8 +635,8 @@ class RealtimeServerTests(unittest.TestCase):
                 self.assertTrue(processor.finished.wait(timeout=1))
                 websocket.send_json(_control("session_end"))
 
-        self.assertTrue(processor.cancel_called.wait(timeout=1))
-        self.assertTrue(processor.close_called.wait(timeout=1))
+        self.assertTrue(processor.cancel_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
+        self.assertTrue(processor.close_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 
@@ -688,9 +693,9 @@ class RealtimeServerTests(unittest.TestCase):
                 # Exiting the WebSocket context simulates a peer disappearing
                 # without cancel_turn or session_end.
 
-        self.assertTrue(processor.finished.wait(timeout=1))
-        self.assertTrue(processor.cancel_called.wait(timeout=1))
-        self.assertTrue(processor.close_called.wait(timeout=1))
+        self.assertTrue(processor.finished.wait(timeout=_CLEANUP_WAIT_SECONDS))
+        self.assertTrue(processor.cancel_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
+        self.assertTrue(processor.close_called.wait(timeout=_CLEANUP_WAIT_SECONDS))
         self.assertTrue(processor.cancelled)
         self.assertTrue(processor.closed)
 

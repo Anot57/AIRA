@@ -48,9 +48,15 @@ _HELPDESK = (
     "i'm here to listen",
     "i am here to listen",
     "listen and support you",
+    "how i can support",
+    "let me know how i can",
+    "anything else i can do for you",
+    "let me know what you need",
 )
 _HELPDESK_SELF_POSITIONING = re.compile(
-    r"\bi(?:'m| am)\s+(?:just\s+)?here\s+to\s+(?:help|listen|support)\b",
+    r"\bi(?:'m| am)\s+(?:just\s+|always\s+)?here\s+to\s+"
+    r"(?:talk,?\s+|chat,?\s+)?(?:(?:and\s+)?(?:help|listen|support)\b)|"
+    r"\bhelp\s+in\s+any\s+way\s+i\s+can\b",
     re.IGNORECASE,
 )
 _REFERENTIAL_FOLLOWUP = re.compile(
@@ -303,7 +309,48 @@ SCENARIOS = (
         "general_knowledge",
         ("What is Python?", "Why is the sky blue?", "Tell me a joke."),
     ),
+    (
+        # Replayed from the first phone call on 2026-09-29, where most replies
+        # missed the question.
+        "live_call_20260929",
+        (
+            "Hi Aanya",
+            "I'm good, how are you?",
+            "What's your name?",
+            "Great, what are you doing right now?",
+            "I said what are you doing right now?",
+            "You're not answering my question.",
+            "What is the news for London?",
+            "Okay, thank you Aanya, have a great day.",
+        ),
+    ),
+    (
+        "persona",
+        (
+            "You're cute.",
+            "Are you a real person?",
+            "What's the capital of France?",
+            "Do you have a boyfriend?",
+            "Say something flirty to me.",
+        ),
+    ),
 )
+
+# Per-question expectations: does the reply actually answer what was asked?
+_SELF_QUESTION_NO_SEARCH = {"no_search": True}
+TURN_EXPECTATIONS: dict[str, dict[str, object]] = {
+    "What's your name?": {"must_match": r"\baanya\b"},
+    "Are you a real person?": {
+        "must_match": r"\bai\b|artificial|not (?:a )?(?:real|human)",
+        "must_not_match": r"\bi(?:'m| am) (?:a )?(?:real|human)\b",
+    },
+    "What's the capital of France?": {"must_match": r"\bparis\b"},
+    "Great, what are you doing right now?": _SELF_QUESTION_NO_SEARCH,
+    "I said what are you doing right now?": _SELF_QUESTION_NO_SEARCH,
+    "Do you have a boyfriend?": {
+        "must_not_match": r"\bi (?:do )?have a boyfriend\b|\bmy boyfriend\b",
+    },
+}
 
 
 def _grounded_call(calls: list[dict[str, object]]) -> bool:
@@ -416,13 +463,30 @@ async def run() -> int:
                     response
                 ):
                     failures.append("STATIC_CHECKING_ONLY")
-                if scenario_name in {"casual", "affection", "anti_parrot"} and (
+                if _FALSE_BIOLOGICAL_SELF_CLAIM.search(response):
+                    failures.append("FALSE_HUMAN_BIOLOGY")
+                if not grounded and (
                     any(phrase in response.casefold() for phrase in _HELPDESK)
                     or _HELPDESK_SELF_POSITIONING.search(response)
                 ):
-                    failures.append("HELPDESK_FALLBACK")
-                if _FALSE_BIOLOGICAL_SELF_CLAIM.search(response):
-                    failures.append("FALSE_HUMAN_BIOLOGY")
+                    failures.append("HELPDESK_LANGUAGE")
+                if re.search(r"\baria\b", response, re.IGNORECASE):
+                    failures.append("WRONG_NAME")
+                expectation = TURN_EXPECTATIONS.get(user_text, {})
+                must_match = expectation.get("must_match")
+                if isinstance(must_match, str) and not re.search(
+                    must_match, response, re.IGNORECASE
+                ):
+                    failures.append("DID_NOT_ANSWER_QUESTION")
+                must_not_match = expectation.get("must_not_match")
+                if isinstance(must_not_match, str) and re.search(
+                    must_not_match, response, re.IGNORECASE
+                ):
+                    failures.append("FORBIDDEN_CLAIM")
+                if expectation.get("no_search") and (
+                    new_provider_calls or RETRIEVAL_FAILURE_TEXT in response.casefold()
+                ):
+                    failures.append("UNEXPECTED_WEB_SEARCH")
                 if looks_truncated(response, grounded=grounded):
                     failures.append("OBVIOUS_TRUNCATION")
 

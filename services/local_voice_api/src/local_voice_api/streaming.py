@@ -21,6 +21,10 @@ from .realtime_protocol import (
 )
 
 _STAGE_DIRECTION = re.compile(r"(?:\*[^*\n]+\*|\[[^\]\n]+\])")
+# Emoji are fine on screen but must never reach the voice.
+_EMOJI = re.compile(
+    "[☀-➿⬀-⯿‍️\U0001f000-\U0001faff]+"
+)
 _SENTENCE_BOUNDARY = re.compile(r"[.!?;:]\s|\n")
 _LOGGER = logging.getLogger(__name__)
 
@@ -473,7 +477,8 @@ class SpeakableTextChunker:
 
 def _clean_speakable_text(text: str) -> str:
     without_directions = _STAGE_DIRECTION.sub(" ", text)
-    return " ".join(without_directions.split()).strip()
+    without_emoji = _EMOJI.sub(" ", without_directions)
+    return " ".join(without_emoji.split()).strip()
 
 
 def read_pcm16_wav(path: Path) -> SynthesizedAudioChunk:

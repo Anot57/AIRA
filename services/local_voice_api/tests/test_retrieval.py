@@ -28,8 +28,15 @@ from local_voice_api.retrieval import (  # noqa: E402
     RetrievalMode,
     RetrievalResult,
     SearxngRetrievalProvider,
+    NewsFeedRetrievalProvider,
+    _could_become_repeated_reaction,
     _grounded_sentence_supported,
+    google_news_feed_url,
+    is_news_lookup,
+    news_search_terms,
+    parse_news_feed,
     _retrieval_prompt,
+    _without_repeated_opening_reaction,
     is_broad_news_query,
     needs_current_information,
     retrieval_mode_for_query,
@@ -122,6 +129,21 @@ class _ScriptedLanguageModel:
             yield self.responses.pop(0)
 
 
+class _ChunkedScriptedLanguageModel:
+    """Streams each scripted response as the given sequence of deltas."""
+
+    def __init__(self, responses: tuple[tuple[str, ...], ...]) -> None:
+        self.responses = list(responses)
+        self.prompts: list[str] = []
+
+    async def stream(self, transcript: str, cancel_event: threading.Event):
+        self.prompts.append(transcript)
+        for delta in self.responses.pop(0):
+            if cancel_event.is_set():
+                return
+            yield delta
+
+
 class _BudgetLanguageModel(_PromptLanguageModel):
     def __init__(self) -> None:
         super().__init__()
@@ -212,7 +234,99 @@ async def _wait_until(predicate) -> None:
     raise AssertionError("Condition did not become true.")
 
 
+class OpeningReactionRepetitionTests(unittest.TestCase):
+    def test_reaction_repeated_from_previous_reply_is_stripped(self) -> None:
+        cases = (
+            ("Oh wow, that's huge.", "Oh wow, nice pick.", "Nice pick."),
+            ("Hmm, maybe.", "Hmmm... let me think about it.", "Let me think about it."),
+            ("Yeah, I get that.", "yeah — it happens to everyone.", "It happens to everyone."),
+            (
+                "Wait, seriously? No way.",
+                "Wait seriously, they cancelled it again?",
+                "They cancelled it again?",
+            ),
+        )
+        for previous, response, expected in cases:
+            with self.subTest(response=response):
+                self.assertEqual(
+                    expected,
+                    _without_repeated_opening_reaction(response, (previous,)),
+                )
+
+    def test_reactions_that_do_not_repeat_the_last_reply_are_kept(self) -> None:
+        cases = (
+            ((), "Oh wow, that's huge."),
+            (("Hmm, maybe.",), "Oh wow, that's huge."),
+            # Only the most recent reply counts; older openings may return.
+            (("Oh wow, cool.", "Hmm, fair."), "Oh wow, that's huge."),
+            (("Oh wow, cool.",), "Oh, that's awkward."),
+            (("Okay, sure.",), "Ok then."),
+            (("Nice, well done.",), "Nice."),
+            (("Yeah, true.",), "Yesterday was fun."),
+        )
+        for recent, response in cases:
+            with self.subTest(response=response, recent=recent):
+                self.assertEqual(
+                    response, _without_repeated_opening_reaction(response, recent)
+                )
+
+    def test_stream_is_held_only_while_a_repeat_is_still_possible(self) -> None:
+        recent = ("Oh wow, that's huge.",)
+
+        for partial in ("O", "Oh", "Oh w", "Oh wow", "Oh wow, the"):
+            with self.subTest(partial=partial):
+                self.assertTrue(_could_become_repeated_reaction(partial, recent))
+        for partial in ("Oh wow, the lake is", "Hmm", "That was"):
+            with self.subTest(partial=partial):
+                self.assertFalse(_could_become_repeated_reaction(partial, recent))
+        self.assertFalse(_could_become_repeated_reaction("Oh", ()))
+
+
 class GroundingEvidenceTests(unittest.TestCase):
+    # Real SearXNG evidence and model output from the 2026-09-29 evaluation,
+    # where a correct answer was rejected over word forms like
+    # "withdrawing"/"withdraws" and "favorite"/"favourite".
+    LONDON_QUERY = "What is the news for London?"
+    LONDON_EVIDENCE = (
+        RetrievalResult(
+            "London | Latest News & Updates - BBC",
+            "https://www.bbc.co.uk/news/england/london",
+            "London · Major works to start on Brent Cross flyover · Lord Mayor "
+            "favourite withdraws after ex-boss probe · 'I love African culture': "
+            "Sir Mark Rylance stars in ...",
+        ),
+    )
+
+    def test_inflected_and_british_spelling_paraphrases_are_supported(self) -> None:
+        for sentence in (
+            "The latest news in London includes major works starting on the "
+            "Brent Cross flyover, a Lord Mayor's favorite withdrawing after an "
+            "ex-boss probe, and Sir Mark Rylance starring in a film that "
+            "showcases his love for African culture.",
+            "Major works are starting on the Brent Cross flyover.",
+            "The Lord Mayor favourite is withdrawing after a probe into an ex-boss.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertTrue(
+                    _grounded_sentence_supported(
+                        self.LONDON_QUERY, sentence, self.LONDON_EVIDENCE
+                    )
+                )
+
+    def test_stemming_never_admits_invented_claims(self) -> None:
+        for sentence in (
+            "The Lord Mayor was arrested and fined 500 pounds.",
+            "London's mayor resigned after a corruption trial and new elections "
+            "were called.",
+            "A huge fire destroyed the Brent Cross shopping centre yesterday.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertFalse(
+                    _grounded_sentence_supported(
+                        self.LONDON_QUERY, sentence, self.LONDON_EVIDENCE
+                    )
+                )
+
     def test_supported_grounded_fact_is_allowed(self) -> None:
         evidence = (
             RetrievalResult(
@@ -1076,6 +1190,199 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, len(local.prompts))
         await model.close()
 
+    async def test_repeated_opening_reaction_is_stripped_without_another_call(
+        self,
+    ) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("Oh wow, that sounds like a great trip.",),
+                # Streamed in pieces: the guard must hold "Oh" and "wow" until
+                # it can tell the reaction is a repeat.
+                ("Oh", " wow,", " the mountains there", " are beautiful."),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        first = await _collect_turn(model, "I just got back from Manali.", generation=1)
+        second = await _collect_turn(model, "We went trekking too.", generation=2)
+
+        self.assertEqual("Oh wow, that sounds like a great trip.", first)
+        self.assertEqual("The mountains there are beautiful.", second)
+        self.assertEqual(2, len(local.prompts))
+        await model.close()
+
+    async def test_trailing_helpdesk_sentence_is_dropped_mid_stream(self) -> None:
+        # Found in a live phone call after the opening had already streamed.
+        local = _ChunkedScriptedLanguageModel(
+            (("Aanya.", " I'm here to listen", " and support you."),)
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "What's your name?")
+
+        self.assertEqual("Aanya.", reply.strip())
+        self.assertEqual(1, len(local.prompts))
+        await model.close()
+
+    async def test_all_helpdesk_reply_falls_back_after_one_bounded_retry(
+        self,
+    ) -> None:
+        # The opening is held (it could still become helpdesk language), so a
+        # wholly helpdesk reply takes the existing single retry, then falls
+        # back to a short natural line instead of speaking it.
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("Let me know how I", " can support you!"),
+                ("Let me know how I", " can help!"),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "I said what are you doing?")
+
+        self.assertTrue(reply.strip())
+        self.assertNotIn("let me know how i", reply.casefold())
+        self.assertEqual(2, len(local.prompts))
+        await model.close()
+
+    async def test_talk_listen_help_variant_is_dropped(self) -> None:
+        # Found in the 1.7B evaluation replying to "Say something flirty".
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Hmm, you first.",
+                    " I'm here to talk, listen, and help in any way I can.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Say something flirty to me.")
+
+        self.assertEqual("Hmm, you first.", reply.strip())
+        await model.close()
+
+    async def test_budget_truncated_final_fragment_is_not_spoken(self) -> None:
+        # Found in the Qwen3-4B evaluation: the 64-token cap cut a reply at
+        # "...I didn't even realize it was the".
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Octopuses have three hearts.",
+                    " Two of them stop beating while they swim, and I didn't",
+                    " even realize it was the",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Tell me something interesting.")
+
+        self.assertEqual("Octopuses have three hearts.", reply.strip())
+        await model.close()
+
+    async def test_repeated_question_gets_the_real_answer_not_go_on(self) -> None:
+        # Found in the Qwen3-4B evaluation: an insisted question got the same
+        # good answer twice, and the repeat guard replaced it with "Go on."
+        answer = "I'm just talking with you right now."
+        local = _ChunkedScriptedLanguageModel(((answer,), (answer,), (answer,)))
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        first = await _collect_turn(
+            model, "What are you doing right now?", generation=1
+        )
+        second = await _collect_turn(
+            model, "I said what are you doing right now?", generation=2
+        )
+
+        self.assertEqual(answer, first)
+        self.assertEqual(answer, second)
+        self.assertEqual(3, len(local.prompts))
+        await model.close()
+
+    async def test_long_reply_stops_at_three_sentences_and_frees_the_model(
+        self,
+    ) -> None:
+        # Live call 2026-09-29: five-sentence replies ran about 11 s.
+        class _LongModel:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+                self.closed_early = False
+
+            async def stream(self, transcript: str, cancel_event):
+                self.prompts.append(transcript)
+                sentences = (
+                    "I'm Aanya.",
+                    " I'm an AI, not a person.",
+                    " I love talking with you.",
+                    " That feels special to me.",
+                    " And that's enough for me.",
+                )
+                delivered = 0
+                try:
+                    for sentence in sentences:
+                        yield sentence
+                        delivered += 1
+                finally:
+                    self.closed_early = delivered < len(sentences)
+
+        local = _LongModel()
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "What's your name and are you real?")
+
+        self.assertEqual(
+            "I'm Aanya. I'm an AI, not a person. I love talking with you.",
+            reply.strip(),
+        )
+        self.assertTrue(local.closed_early)
+        await model.close()
+
+    async def test_dependency_claims_are_never_spoken(self) -> None:
+        # Live call 2026-09-29: "like a friend who's always there".
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "I'm an AI.",
+                    " Think of me like a friend who's always there.",
+                    " What's on your mind?",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Are you a real person?")
+
+        self.assertEqual("I'm an AI. What's on your mind?", reply.strip())
+        await model.close()
+
+    async def test_ordinary_multi_sentence_reply_streams_unchanged(self) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (("Just talking", " with you. What's", " on your mind?"),)
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "What are you doing right now?")
+
+        self.assertEqual("Just talking with you. What's on your mind?", reply)
+        await model.close()
+
+    async def test_different_or_first_reactions_are_kept(self) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("Hmm, that's a tough one.",),
+                ("Oh nice, you figured it out.",),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        first = await _collect_turn(model, "I can't decide.", generation=1)
+        second = await _collect_turn(model, "I picked the blue one.", generation=2)
+
+        self.assertEqual("Hmm, that's a tough one.", first)
+        self.assertEqual("Oh nice, you figured it out.", second)
+        await model.close()
+
     async def test_grounded_continuation_strips_duplicate_check_acknowledgement(
         self,
     ) -> None:
@@ -1094,6 +1401,93 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
             "one sec", "let me check", "let me see", "checking",
         )))
         self.assertNotIn("let me check", response.casefold())
+        await model.close()
+
+    async def test_grounded_answer_never_narrates_the_references(self) -> None:
+        # Found in the Qwen3-4B evaluation: "The references confirm recent
+        # sports news: ... No information is provided about ...".
+        evidence = RetrievalResult(
+            "Virat Kohli passes 15,000 ODI runs as India beat West Indies",
+            "https://www.bbc.com/sport/cricket",
+            "BBC",
+        )
+        local = _ScriptedLanguageModel(
+            (
+                "Virat Kohli has passed 15,000 ODI runs as India beat West "
+                "Indies. No information is provided about other matches. "
+                "The provided references do not detail the score.",
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider((evidence,)))
+
+        response = await _collect_turn(model, "What is the latest cricket news?")
+
+        self.assertIn("Virat Kohli has passed 15,000 ODI runs", response)
+        self.assertNotIn("reference", response.casefold())
+        self.assertNotIn("information is provided", response.casefold())
+        await model.close()
+
+    async def test_final_grounded_sentence_never_narrates_references(self) -> None:
+        # Live call 2026-09-29: "The other reference is about a terrorist plot
+        # in the UK and is unrelated." was spoken because it was the last
+        # sentence, which is checked after the stream ends.
+        evidence = (
+            RetrievalResult(
+                "Prosecutor reopens probe into Cornell gang rape allegations",
+                "https://apnews.com/article/cornell",
+                "AP News",
+            ),
+            RetrievalResult(
+                "UK villages abuzz over possible terrorist plot",
+                "https://www.nytimes.com/uk-plot",
+                "The New York Times",
+            ),
+        )
+        local = _ScriptedLanguageModel(
+            (
+                "Prosecutors reopened the Cornell probe into the gang rape "
+                "allegations. The other reference is about a terrorist plot in "
+                "the UK and is unrelated.",
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider(evidence))
+
+        response = await _collect_turn(model, "What's the trending news in America?")
+
+        self.assertIn("Prosecutors reopened the Cornell probe", response)
+        self.assertNotIn("reference", response.casefold())
+        await model.close()
+
+    async def test_topic_free_follow_ups_continue_the_current_story(self) -> None:
+        # Live call 2026-09-29: these searched for their own words ("more")
+        # and failed instead of continuing the Cornell story.
+        evidence = (
+            RetrievalResult(
+                "Prosecutor reopens probe into Cornell gang rape allegations",
+                "https://apnews.com/article/cornell",
+                "AP News",
+            ),
+        )
+        provider = _Provider(evidence)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+        first_query = "What's the trending news in America?"
+
+        await _collect_turn(model, first_query, generation=1)
+        await _collect_turn(
+            model,
+            "Yeah, tell me more about it, what's going on with it?",
+            generation=2,
+        )
+        await _collect_turn(
+            model, "Can't you deep dive into this particular news?", generation=3
+        )
+        await _collect_turn(model, "What's going on in Nepal?", generation=4)
+
+        searched = [call[0] for call in provider.calls]
+        self.assertEqual(
+            [first_query, first_query, first_query, "What's going on in Nepal?"],
+            searched,
+        )
         await model.close()
 
     async def test_unsupported_grounded_draft_retries_once(
@@ -1352,6 +1746,30 @@ class RetrievalConfigurationTests(unittest.TestCase):
         self.assertFalse(needs_current_information("How can I control diabetes?"))
         self.assertFalse(needs_current_information("I had coffee today."))
 
+    def test_questions_about_the_companion_are_not_web_searches(self) -> None:
+        # Found in a live phone call: "right now" sent this to web search.
+        for query in (
+            "What are you doing right now?",
+            "Great, what are you doing right now?",
+            "What're you up to tonight?",
+            "How are you today?",
+            "How's your day going today?",
+            "Are you free tonight?",
+            "What are your plans this weekend?",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(needs_current_information(query))
+
+    def test_named_subjects_still_search_even_when_addressing_her(self) -> None:
+        for query in (
+            "What is the weather right now?",
+            "Can you tell me the latest news right now?",
+            "How are you? Also, what's the cricket score today?",
+            "What are you doing right now? Any news today?",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(needs_current_information(query))
+
     def test_broad_news_detection_is_conservative(self) -> None:
         self.assertTrue(is_broad_news_query("Give me world news."))
         self.assertTrue(is_broad_news_query("Narrate the news."))
@@ -1432,6 +1850,202 @@ class RetrievalConfigurationTests(unittest.TestCase):
         self.assertEqual([FAST_NEWS_ENGINES], parameters["engines"])
         self.assertEqual(MAX_RETRIEVAL_RESULTS, len(results))
         self.assertTrue(all(len(result.snippet) <= 140 for result in results))
+
+    def test_disabled_news_engines_give_news_the_full_general_budget(
+        self,
+    ) -> None:
+        # Live finding: Google News is CAPTCHA-suspended and the other news
+        # engines are unresponsive, so the preferred pass only burned budget.
+        payload = {
+            "results": [
+                {"title": "London result", "url": "https://example.com/1"},
+            ]
+        }
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                del args
+
+            def read(self, limit: int) -> bytes:
+                del limit
+                return json.dumps(payload).encode()
+
+        provider = SearxngRetrievalProvider(
+            "http://127.0.0.1:8888", timeout_seconds=3.0, news_engines=""
+        )
+        with patch(
+            "local_voice_api.retrieval.urlopen",
+            return_value=_Response(),
+        ) as request:
+            results = provider._search_sync("What is the news for London?", False, 6)
+
+        self.assertEqual(1, request.call_count)
+        sent_request = request.call_args.args[0]
+        parameters = parse_qs(urlsplit(sent_request.full_url).query)
+        self.assertNotIn("engines", parameters)
+        self.assertEqual(3.0, request.call_args.kwargs["timeout"])
+        self.assertEqual(1, len(results))
+
+    def test_search_timeout_and_news_engines_come_from_the_environment(
+        self,
+    ) -> None:
+        provider = retrieval_provider_from_environment(
+            {
+                "AIRA_SEARCH_PROVIDER": "searxng",
+                "AIRA_SEARXNG_URL": "http://127.0.0.1:8888",
+                "AIRA_SEARCH_TIMEOUT_SECONDS": "3",
+                "AIRA_SEARCH_NEWS_ENGINES": "",
+            }
+        )
+        self.assertEqual(3.0, provider._timeout_seconds)
+        self.assertEqual("", provider._news_engines)
+
+        default = retrieval_provider_from_environment(
+            {
+                "AIRA_SEARCH_PROVIDER": "searxng",
+                "AIRA_SEARXNG_URL": "http://127.0.0.1:8888",
+            }
+        )
+        self.assertEqual(2.0, default._timeout_seconds)
+        self.assertEqual(FAST_NEWS_ENGINES, default._news_engines)
+
+        for bad in ("0", "-1", "7", "soon"):
+            with self.subTest(timeout=bad), self.assertRaises(ValueError):
+                retrieval_provider_from_environment(
+                    {
+                        "AIRA_SEARCH_PROVIDER": "searxng",
+                        "AIRA_SEARXNG_URL": "http://127.0.0.1:8888",
+                        "AIRA_SEARCH_TIMEOUT_SECONDS": bad,
+                    }
+                )
+
+    def test_news_questions_route_to_the_headline_feed(self) -> None:
+        for query, terms in (
+            ("Can you tell me the latest Nepal news?", ("nepal",)),
+            ("What is the news for London?", ("london",)),
+            (
+                "Can you tell me about Donald Trump's latest legal issues?",
+                ("donald", "trump", "legal", "issues"),
+            ),
+            ("latest football news", ("football",)),
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(is_news_lookup(query))
+                self.assertEqual(terms, news_search_terms(query))
+        for query in ("What's the weather today?", "What is Python?", "Tell me more."):
+            with self.subTest(query=query):
+                self.assertFalse(is_news_lookup(query))
+
+    def test_chat_words_are_not_news_topics_and_countries_pick_editions(
+        self,
+    ) -> None:
+        # Live call 2026-09-29: "Nice!" became a search for Nice (France) plus
+        # "trending", and every America news turn failed.
+        query = (
+            "Nice! What is the news of America right now? "
+            "The trending news in America?"
+        )
+        self.assertEqual(("america",), news_search_terms(query))
+        self.assertTrue(
+            google_news_feed_url(query, region="IN").endswith(
+                "/rss?hl=en-US&gl=US&ceid=US:en"
+            )
+        )
+        self.assertIn(
+            "hl=en-GB&gl=GB",
+            google_news_feed_url("UK news today", region="IN"),
+        )
+        self.assertIn(
+            "search?q=nepal",
+            google_news_feed_url("Check again, the latest Nepal news", region="IN"),
+        )
+
+    def test_feed_urls_use_topics_search_or_top_stories(self) -> None:
+        self.assertIn(
+            "/headlines/section/topic/WORLD?",
+            google_news_feed_url("Tell me the latest world news.", region="IN"),
+        )
+        self.assertIn(
+            "search?q=london+when%3A3d&hl=en-IN&gl=IN&ceid=IN:en",
+            google_news_feed_url("What is the news for London?", region="IN"),
+        )
+        self.assertTrue(
+            google_news_feed_url("Latest news?", region="GB").endswith(
+                "/rss?hl=en-GB&gl=GB&ceid=GB:en"
+            )
+        )
+
+    def test_feed_items_become_dated_headlines_with_their_source(self) -> None:
+        raw = (
+            b"<?xml version='1.0'?><rss><channel>"
+            b"<item><title>Nepal hit by deadly floods - aljazeera.com</title>"
+            b"<link>https://news.google.com/rss/articles/abc</link>"
+            b"<pubDate>Tue, 29 Sep 2026 06:00:00 GMT</pubDate>"
+            b"<source url='https://www.aljazeera.com'>aljazeera.com</source></item>"
+            b"<item><title>Huge landslide crashes into a river in Nepal - CNN</title>"
+            b"<link>https://news.google.com/rss/articles/def</link>"
+            b"<pubDate>Mon, 28 Sep 2026 10:00:00 GMT</pubDate>"
+            b"<source url='https://www.cnn.com'>CNN</source></item>"
+            b"</channel></rss>"
+        )
+
+        results = parse_news_feed(raw, limit=5)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual("Nepal hit by deadly floods", results[0].title)
+        self.assertEqual("aljazeera.com", results[0].snippet)
+        self.assertEqual("https://www.aljazeera.com", results[0].url)
+        self.assertIsNotNone(results[0].published_at)
+
+    def test_non_news_and_failed_feeds_fall_through_to_general_search(self) -> None:
+        class _General:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            async def search(self, query, *, medical, limit):
+                self.queries.append(query)
+                return (RetrievalResult("General", "https://example.com", "x"),)
+
+        general = _General()
+        provider = NewsFeedRetrievalProvider(general, timeout_seconds=1.0)
+
+        weather = asyncio.run(
+            provider.search("What's the weather today?", medical=False, limit=3)
+        )
+        with patch(
+            "local_voice_api.retrieval.urlopen", side_effect=TimeoutError()
+        ):
+            news = asyncio.run(
+                provider.search("latest Nepal news", medical=False, limit=3)
+            )
+
+        self.assertEqual("General", weather[0].title)
+        self.assertEqual("General", news[0].title)
+        self.assertEqual(
+            ["What's the weather today?", "latest Nepal news"], general.queries
+        )
+
+    def test_news_feed_is_opt_in_from_the_environment(self) -> None:
+        base = {
+            "AIRA_SEARCH_PROVIDER": "searxng",
+            "AIRA_SEARXNG_URL": "http://127.0.0.1:8888",
+        }
+        self.assertIsInstance(
+            retrieval_provider_from_environment(base), SearxngRetrievalProvider
+        )
+        self.assertIsInstance(
+            retrieval_provider_from_environment(
+                {**base, "AIRA_NEWS_PROVIDER": "google_news_rss"}
+            ),
+            NewsFeedRetrievalProvider,
+        )
+        with self.assertRaises(ValueError):
+            retrieval_provider_from_environment(
+                {**base, "AIRA_NEWS_PROVIDER": "google_news_rss", "AIRA_NEWS_REGION": "India"}
+            )
 
     def test_searxng_keeps_title_and_safe_url_without_content(self) -> None:
         payload = {

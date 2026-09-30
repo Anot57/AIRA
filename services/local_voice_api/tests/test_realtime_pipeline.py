@@ -897,6 +897,17 @@ class StreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((), chunker.feed("Short tail"))
         self.assertEqual(("Short tail",), chunker.finish())
 
+    def test_chunker_never_sends_emoji_to_the_voice(self) -> None:
+        # Qwen3-4B adds emoji ("Paris. 😊"); TTS must not try to speak them.
+        chunker = SpeakableTextChunker(min_characters=5, max_characters=60)
+
+        self.assertEqual(
+            ("The capital of France is Paris.",),
+            chunker.feed("The capital of France is Paris. 😊 "),
+        )
+        self.assertEqual((), chunker.feed("💫"))
+        self.assertEqual((), chunker.finish())
+
     def test_synthesized_audio_rejects_partial_or_non_pcm16_frames(self) -> None:
         with self.assertRaises(ValueError):
             SynthesizedAudioChunk(b"\x00", 16_000, 1)

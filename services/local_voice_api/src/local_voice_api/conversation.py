@@ -57,7 +57,9 @@ LLM_MODEL_REPOSITORY = "ggml-org/Qwen3-1.7B-GGUF"
 LLM_MODEL_FILENAME = "Qwen3-1.7B-Q4_K_M.gguf"
 LLM_MODEL_NAME = "Qwen3-1.7B Q4_K_M"
 DEFAULT_LLM_CONTEXT_SIZE = 2048
-CASUAL_LLM_MAX_TOKENS = 64
+# Room for two or three spoken sentences from a 4B model without cutting the
+# last one off; replies stay short through the prompt, not the cap.
+CASUAL_LLM_MAX_TOKENS = 96
 SPECIFIC_RETRIEVAL_LLM_MAX_TOKENS = 144
 BROAD_NEWS_LLM_MAX_TOKENS = 208
 DEFAULT_LLM_MAX_TOKENS = CASUAL_LLM_MAX_TOKENS

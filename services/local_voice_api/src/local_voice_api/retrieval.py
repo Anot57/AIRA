@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import Protocol
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from .conversation import (
     BROAD_NEWS_LLM_MAX_TOKENS,
@@ -34,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 SEARCH_PROVIDER_ENVIRONMENT = "AIRA_SEARCH_PROVIDER"
 SEARXNG_URL_ENVIRONMENT = "AIRA_SEARXNG_URL"
+SEARCH_TIMEOUT_ENVIRONMENT = "AIRA_SEARCH_TIMEOUT_SECONDS"
+SEARCH_NEWS_ENGINES_ENVIRONMENT = "AIRA_SEARCH_NEWS_ENGINES"
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 2.0
+# Bounded so a misconfiguration can never stall a spoken turn for long.
+MAX_SEARCH_TIMEOUT_SECONDS = 6.0
 MAX_SEARCH_RESPONSE_BYTES = 128 * 1024
 MAX_RETRIEVAL_CONTEXT_CHARACTERS = 1_100
 MAX_SPECIFIC_RETRIEVAL_RESULTS = 2
@@ -161,6 +166,17 @@ _CURRENT_INFORMATION_SUBJECT = re.compile(
     r"release|ceo|president)\b",
     re.IGNORECASE,
 )
+# Questions about the companion herself ("what are you doing right now?") are
+# conversation, not current-information lookups, unless they name a subject
+# such as news or weather.
+_COMPANION_SELF_QUERY = re.compile(
+    r"\b(?:what(?:'re|\s+are)\s+(?:you|u)\s+(?:doing|up\s+to|thinking|feeling)|"
+    r"how\s+(?:are|r)\s+(?:you|u)\b|"
+    r"how(?:'s|\s+is|\s+was)\s+your\s+(?:day|night|evening|morning|weekend)|"
+    r"are\s+(?:you|u)\s+(?:free|busy|awake|there|up|around)|"
+    r"what(?:'s|\s+is|\s+are)\s+your\s+plans?)",
+    re.IGNORECASE,
+)
 _PERSONAL_TIME_STATEMENT = re.compile(
     r"^\s*(?:i|we|my|our)\b",
     re.IGNORECASE,
@@ -232,9 +248,15 @@ _HELPDESK_RESPONSES = (
     "i am here to listen",
     "listen and support you",
     "what do you need help with",
+    "how i can support",
+    "let me know how i can",
+    "anything else i can do for you",
+    "let me know what you need",
 )
 _HELPDESK_SELF_POSITIONING = re.compile(
-    r"\bi(?:'m| am)\s+(?:just\s+)?here\s+to\s+(?:help|listen|support)\b",
+    r"\bi(?:'m| am)\s+(?:just\s+|always\s+)?here\s+to\s+"
+    r"(?:talk,?\s+|chat,?\s+)?(?:(?:and\s+)?(?:help|listen|support)\b)|"
+    r"\bhelp\s+in\s+any\s+way\s+i\s+can\b",
     re.IGNORECASE,
 )
 
@@ -314,6 +336,7 @@ class SearxngRetrievalProvider:
         base_url: str,
         *,
         timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT_SECONDS,
+        news_engines: str = FAST_NEWS_ENGINES,
     ) -> None:
         parsed = urlsplit(base_url.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -324,6 +347,9 @@ class SearxngRetrievalProvider:
             raise ValueError("Search timeout must be positive.")
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        # Empty disables the preferred news-engine pass, e.g. when those
+        # engines are CAPTCHA-blocked and only waste the search budget.
+        self._news_engines = news_engines.strip()
 
     async def search(
         self, query: str, *, medical: bool, limit: int
@@ -403,9 +429,10 @@ class SearxngRetrievalProvider:
             return _deduplicate_results(parsed)
 
         parameters = dict(base_parameters)
+        preferred_news = news_query and bool(self._news_engines)
 
-        if news_query:
-            parameters["engines"] = FAST_NEWS_ENGINES
+        if preferred_news:
+            parameters["engines"] = self._news_engines
 
         preferred_failed = False
         try:
@@ -413,13 +440,13 @@ class SearxngRetrievalProvider:
                 parameters,
                 timeout_seconds=(
                     max(0.25, self._timeout_seconds * 0.45)
-                    if news_query
+                    if preferred_news
                     else self._timeout_seconds
                 ),
             )
             results = parse_results(candidates)
         except Exception as error:
-            if not news_query:
+            if not preferred_news:
                 raise
             preferred_failed = True
             unresponsive_engines = (type(error).__name__,)
@@ -441,7 +468,7 @@ class SearxngRetrievalProvider:
         # Google News may be CAPTCHA-suspended and Reuters may occasionally
         # time out. A preferred-engine failure must not make Aira believe the
         # Internet has no current information when normal SearXNG engines do.
-        if news_query and not results:
+        if preferred_news and not results:
             logger.info(
                 "[AIRA RETRIEVAL] "
                 "preferred_news_search_empty fallback=general"
@@ -474,6 +501,227 @@ class SearxngRetrievalProvider:
         return tuple(results[: min(limit, MAX_RETRIEVAL_RESULTS)])
 
 
+NEWS_PROVIDER_ENVIRONMENT = "AIRA_NEWS_PROVIDER"
+NEWS_REGION_ENVIRONMENT = "AIRA_NEWS_REGION"
+GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss"
+MAX_NEWS_FEED_BYTES = 512 * 1024
+_NEWS_FRESHNESS = re.compile(
+    r"\b(?:latest|recent|today|tonight|breaking|updates?|this\s+week)\b",
+    re.IGNORECASE,
+)
+# Lookups a headline feed cannot answer; these stay on general search.
+_NOT_A_NEWS_LOOKUP = re.compile(
+    r"\b(?:weather|forecast|temperature|price|prices|stock|rate|score|"
+    r"schedule|version|release)\b",
+    re.IGNORECASE,
+)
+_NEWS_FILLER_WORDS = frozenset(
+    {
+        "again", "also", "any", "big", "biggest", "breaking", "can", "check",
+        "cool", "could", "current", "for", "from", "going", "great", "happening",
+        "headline", "headlines", "hey", "hi", "hmm", "is", "main", "major",
+        "narrate", "new", "nice", "now", "oh", "ok", "okay", "please", "recent",
+        "right", "show", "so", "tonight", "top", "trending", "updates", "week",
+        "well", "whats", "wow", "yeah",
+    }
+)
+# A country on its own ("trending news in America") means that edition's top
+# stories, not a keyword search for the country's name.
+_NEWS_EDITIONS = {
+    "america": "US",
+    "american": "US",
+    "usa": "US",
+    "states": "US",
+    "uk": "GB",
+    "britain": "GB",
+    "british": "GB",
+    "england": "GB",
+    "india": "IN",
+    "indian": "IN",
+    "australia": "AU",
+    "canada": "CA",
+    "singapore": "SG",
+    "ireland": "IE",
+}
+_NEWS_EDITION_ONLY_WORDS = frozenset({"united", "country", "nation", "national"})
+_NEWS_TOPICS = {
+    "world": "WORLD",
+    "international": "WORLD",
+    "global": "WORLD",
+    "sports": "SPORTS",
+    "sport": "SPORTS",
+    "business": "BUSINESS",
+    "tech": "TECHNOLOGY",
+    "technology": "TECHNOLOGY",
+    "science": "SCIENCE",
+    "entertainment": "ENTERTAINMENT",
+    "health": "HEALTH",
+}
+
+
+def is_news_lookup(query: str) -> bool:
+    """Questions a headline feed answers better than general web pages."""
+
+    if _NEWS_QUERY.search(query) or is_broad_news_query(query):
+        return True
+    if _CURRENT_EVENT_QUERY.search(query):
+        return True
+    return bool(_NEWS_FRESHNESS.search(query)) and not _NOT_A_NEWS_LOOKUP.search(query)
+
+
+def news_search_terms(query: str) -> tuple[str, ...]:
+    """Topic words of a news question: "latest Nepal news?" -> ("nepal",)."""
+
+    terms: list[str] = []
+    for token in (t.casefold() for t in _TOPIC_TOKEN.findall(query)):
+        if (
+            len(token) > 1
+            and token not in _TOPIC_STOP_WORDS
+            and token not in _NEWS_FILLER_WORDS
+            and token not in terms
+        ):
+            terms.append(token)
+    return tuple(terms)
+
+
+_TOPIC_FREE_FOLLOW_UP_WORDS = frozenset(
+    {
+        "case", "deep", "detail", "details", "dive", "elaborate", "explain",
+        "further", "info", "information", "into", "know", "more", "one",
+        "particular", "same", "stories", "story", "them", "thing", "those",
+        "these", "they", "update",
+    }
+)
+_REFERS_BACK = re.compile(
+    r"\b(?:it|that|this|these|those|them|more|further|deep\s+dive|details?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_topic_free_follow_up(transcript: str) -> bool:
+    """True for "tell me more about it" style turns that name no new topic."""
+
+    if not _REFERS_BACK.search(transcript):
+        return False
+    return all(
+        term in _TOPIC_FREE_FOLLOW_UP_WORDS for term in news_search_terms(transcript)
+    )
+
+
+def google_news_feed_url(query: str, *, region: str) -> str:
+    terms = news_search_terms(query)
+    editions = {_NEWS_EDITIONS[term] for term in terms if term in _NEWS_EDITIONS}
+    if len(editions) == 1:
+        region = editions.pop()
+        terms = tuple(
+            term
+            for term in terms
+            if term not in _NEWS_EDITIONS and term not in _NEWS_EDITION_ONLY_WORDS
+        )
+    locale = f"hl=en-{region}&gl={region}&ceid={region}:en"
+    if not terms:
+        return f"{GOOGLE_NEWS_RSS_BASE}?{locale}"
+    if len(terms) == 1 and terms[0] in _NEWS_TOPICS:
+        topic = _NEWS_TOPICS[terms[0]]
+        return f"{GOOGLE_NEWS_RSS_BASE}/headlines/section/topic/{topic}?{locale}"
+    search = urlencode({"q": " ".join(terms) + " when:3d"})
+    return f"{GOOGLE_NEWS_RSS_BASE}/search?{search}&{locale}"
+
+
+def parse_news_feed(raw: bytes, *, limit: int) -> tuple[RetrievalResult, ...]:
+    root = ElementTree.fromstring(raw)
+    results: list[RetrievalResult] = []
+    for item in root.iter("item"):
+        title = _bounded_text(item.findtext("title"), 200)
+        source_element = item.find("source")
+        source = _bounded_text(
+            source_element.text if source_element is not None else "", 80
+        )
+        if source and title.endswith(f" - {source}"):
+            title = title[: -len(source) - 3].rstrip()
+        url = _safe_result_url(
+            (source_element.get("url") if source_element is not None else None)
+            or item.findtext("link")
+        )
+        published_at = None
+        try:
+            published_at = parsedate_to_datetime(
+                item.findtext("pubDate") or ""
+            ).timestamp()
+        except (TypeError, ValueError, IndexError):
+            pass
+        if title and url:
+            results.append(
+                RetrievalResult(
+                    title,
+                    url,
+                    source,
+                    published_at=published_at,
+                    engine="google news rss",
+                )
+            )
+    results = _deduplicate_results(results)
+    # Keep the feed's relevance order; only lift reputable outlets forward.
+    results.sort(key=lambda result: not _is_reputable_news(result.url))
+    return tuple(results[:limit])
+
+
+class NewsFeedRetrievalProvider:
+    """Answer news questions from dated headlines instead of landing pages.
+
+    General web search mostly returns section front pages ("World News - The
+    New York Times") with no facts in them, and the SearXNG news engines are
+    CAPTCHA-blocked on this network. Google News RSS returns real headlines.
+    Anything that is not a news question, and any feed failure, falls through
+    to the general provider.
+    """
+
+    def __init__(
+        self,
+        general: RetrievalProvider,
+        *,
+        region: str = "IN",
+        timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT_SECONDS,
+    ) -> None:
+        if not re.fullmatch(r"[A-Z]{2}", region):
+            raise ValueError("AIRA_NEWS_REGION must be a two-letter country code.")
+        self._general = general
+        self._region = region
+        self._timeout_seconds = timeout_seconds
+
+    async def search(
+        self, query: str, *, medical: bool, limit: int
+    ) -> tuple[RetrievalResult, ...]:
+        if medical or not query.strip() or not is_news_lookup(query):
+            return await self._general.search(query, medical=medical, limit=limit)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_sync, query, limit),
+                timeout=self._timeout_seconds + 0.25,
+            )
+        except Exception as error:
+            logger.warning(
+                "[AIRA RETRIEVAL] news_feed_failed reason=%s fallback=general",
+                type(error).__name__,
+            )
+            results = ()
+        if results:
+            return results
+        return await self._general.search(query, medical=medical, limit=limit)
+
+    def _fetch_sync(self, query: str, limit: int) -> tuple[RetrievalResult, ...]:
+        request = Request(
+            google_news_feed_url(query, region=self._region),
+            headers={"User-Agent": "Mozilla/5.0 (Aira-local/1)"},
+        )
+        with urlopen(request, timeout=self._timeout_seconds) as response:
+            raw = response.read(MAX_NEWS_FEED_BYTES + 1)
+        if len(raw) > MAX_NEWS_FEED_BYTES:
+            raw = raw[:MAX_NEWS_FEED_BYTES]
+            raw = raw[: raw.rfind(b"</item>") + len(b"</item>")] + b"</channel></rss>"
+        return parse_news_feed(raw, limit=limit)
+
+
 def retrieval_provider_from_environment(
     environ: Mapping[str, str] | None = None,
 ) -> RetrievalProvider:
@@ -485,7 +733,33 @@ def retrieval_provider_from_environment(
         endpoint = source.get(SEARXNG_URL_ENVIRONMENT, "").strip()
         if not endpoint:
             raise ValueError("AIRA_SEARXNG_URL is required when search uses searxng.")
-        return SearxngRetrievalProvider(endpoint)
+        raw_timeout = source.get(SEARCH_TIMEOUT_ENVIRONMENT, "").strip()
+        try:
+            timeout_seconds = (
+                float(raw_timeout) if raw_timeout else DEFAULT_SEARCH_TIMEOUT_SECONDS
+            )
+        except ValueError as error:
+            raise ValueError("AIRA_SEARCH_TIMEOUT_SECONDS must be a number.") from error
+        if not 0 < timeout_seconds <= MAX_SEARCH_TIMEOUT_SECONDS:
+            raise ValueError(
+                "AIRA_SEARCH_TIMEOUT_SECONDS must be above 0 and at most "
+                f"{MAX_SEARCH_TIMEOUT_SECONDS:g}."
+            )
+        general = SearxngRetrievalProvider(
+            endpoint,
+            timeout_seconds=timeout_seconds,
+            news_engines=source.get(SEARCH_NEWS_ENGINES_ENVIRONMENT, FAST_NEWS_ENGINES),
+        )
+        news = source.get(NEWS_PROVIDER_ENVIRONMENT, "").strip().casefold()
+        if news in {"", "disabled", "none"}:
+            return general
+        if news == "google_news_rss":
+            return NewsFeedRetrievalProvider(
+                general,
+                region=source.get(NEWS_REGION_ENVIRONMENT, "IN").strip().upper(),
+                timeout_seconds=timeout_seconds,
+            )
+        raise ValueError("AIRA_NEWS_PROVIDER must be 'disabled' or 'google_news_rss'.")
     raise ValueError("AIRA_SEARCH_PROVIDER must be 'disabled' or 'searxng'.")
 
 
@@ -703,6 +977,15 @@ class AsyncRetrievalLanguageModel:
                 elif _RETRY_RETRIEVAL_FOLLOW_UP.search(transcript):
                     mode = RetrievalMode.CURRENT_TURN_REQUIRED
                     effective_query = active_topic.query
+        elif _is_topic_free_follow_up(transcript):
+            # "Tell me more about it, what's going on with it?" names no topic
+            # of its own; searching its words would find nothing. Continue the
+            # story already being discussed instead.
+            self._prune_contexts()
+            topic = self._latest_active_topic(session_id, generation=generation)
+            if topic is not None:
+                active_topic = topic
+                effective_query = topic.query
         debug_retrieval_mode(mode.value)
         if mode is RetrievalMode.NONE:
             context = (
@@ -906,10 +1189,8 @@ class AsyncRetrievalLanguageModel:
         )
         if grounded:
             _mark_realtime_boundary("grounded_http_request_start")
-        recent_responses = tuple(
-            response
-            for _user, response in self._conversation_history.get(session_id, ())
-        )
+        history = self._conversation_history.get(session_id, ())
+        recent_responses = tuple(response for _user, response in history)
         async for delta in self._guarded_response_stream(
             model_input,
             user_query,
@@ -918,6 +1199,7 @@ class AsyncRetrievalLanguageModel:
             grounded=grounded,
             recent_responses=recent_responses,
             grounding_evidence=grounding_evidence,
+            previous_user_query=history[-1][0] if history else None,
         ):
             yield delta
 
@@ -931,6 +1213,7 @@ class AsyncRetrievalLanguageModel:
         grounded: bool,
         recent_responses: tuple[str, ...],
         grounding_evidence: tuple[RetrievalResult, ...] = (),
+        previous_user_query: str | None = None,
     ) -> AsyncIterator[str]:
         """Guard social drafts and evidence-bound grounded sentences."""
 
@@ -975,6 +1258,10 @@ class AsyncRetrievalLanguageModel:
                         ).strip()
                         if not candidate:
                             continue
+                        # Never narrate the retrieval machinery aloud ("The
+                        # provided references do not detail...").
+                        if _REFERENCE_META.search(candidate):
+                            continue
                         if not _is_usable_response(
                             user_query,
                             candidate,
@@ -1005,6 +1292,10 @@ class AsyncRetrievalLanguageModel:
                         sentence
                     ).strip()
                     if not candidate:
+                        continue
+                    # Same rule as mid-stream: the final sentence is where
+                    # "The other reference is ... unrelated." slipped through.
+                    if _REFERENCE_META.search(candidate):
                         continue
                     if not _is_usable_response(
                         user_query,
@@ -1051,21 +1342,39 @@ class AsyncRetrievalLanguageModel:
 
             pending = ""
             emitted = False
-            async for delta in self._model_stream_with_budget(
+            released_text = False
+            helpdesk_filter = (
+                None
+                if grounded
+                else _HelpdeskSentenceFilter(
+                    max_sentences=MAX_CONVERSATIONAL_SENTENCES
+                )
+            )
+            model_stream = self._model_stream_with_budget(
                 prompt,
                 cancel_event,
                 token_budget=token_budget,
-            ):
+            )
+            async for delta in model_stream:
                 if cancel_event.is_set():
                     return
                 if emitted:
-                    yield delta
+                    text = (
+                        delta
+                        if helpdesk_filter is None
+                        else helpdesk_filter.feed(delta)
+                    )
+                    if text:
+                        released_text = True
+                        yield text
+                    if helpdesk_filter is not None and helpdesk_filter.done:
+                        break
                     continue
                 pending += delta
                 candidate = (
                     _strip_checking_acknowledgement(pending)
                     if grounded
-                    else pending
+                    else _without_repeated_opening_reaction(pending, recent_responses)
                 )
                 if validate_full_short_response:
                     continue
@@ -1083,16 +1392,38 @@ class AsyncRetrievalLanguageModel:
                     recent_responses=recent_responses,
                 ):
                     emitted = True
-                    if candidate:
-                        yield candidate
+                    text = (
+                        candidate
+                        if helpdesk_filter is None
+                        else helpdesk_filter.feed(candidate)
+                    )
+                    if text:
+                        released_text = True
+                        yield text
+                    if helpdesk_filter is not None and helpdesk_filter.done:
+                        break
+
+            if helpdesk_filter is not None and helpdesk_filter.done:
+                # Stop generating now: the next turn shares the single model
+                # slot, so an unspoken tail would only delay it.
+                await model_stream.aclose()
 
             if emitted:
+                if helpdesk_filter is not None:
+                    tail = helpdesk_filter.finish()
+                    if tail:
+                        released_text = True
+                        yield tail
+                    if not released_text:
+                        # Every sentence was helpdesk language; speak a short
+                        # natural reply rather than nothing.
+                        yield _safe_social_fallback(user_query)
                 return
 
             candidate = (
                 _strip_checking_acknowledgement(pending)
                 if grounded
-                else pending
+                else _without_repeated_opening_reaction(pending, recent_responses)
             )
             if _is_usable_response(
                 user_query,
@@ -1103,6 +1434,20 @@ class AsyncRetrievalLanguageModel:
                 yield candidate
                 return
 
+        # Both drafts failed. When the user repeated their question ("I said
+        # what are you doing?") and the draft failed only for repeating the
+        # earlier reply, repeating a real answer beats an evasive "Go on."
+        if (
+            not grounded
+            and previous_user_query is not None
+            and _restates_previous_question(user_query, previous_user_query)
+            and candidate.strip()
+            and _is_usable_response(
+                user_query, candidate, grounded=False, recent_responses=()
+            )
+        ):
+            yield candidate
+            return
         yield (
             _RETRIEVAL_FAILURE_RESPONSE
             if grounded
@@ -1129,8 +1474,15 @@ class AsyncRetrievalLanguageModel:
                 cancel_event,
                 max_tokens=token_budget,
             )
-        async for delta in response_stream:
-            yield delta
+        try:
+            async for delta in response_stream:
+                yield delta
+        finally:
+            # Close the model request as soon as the caller stops reading, so
+            # llama-server stops generating instead of holding its only slot.
+            aclose = getattr(response_stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     def _conversation_input(
         self,
@@ -1412,6 +1764,14 @@ class AsyncRetrievalLanguageModel:
             or _REFINEMENT_FOLLOW_UP.search(transcript)
         ):
             return None
+        return self._latest_active_topic(session_id, generation=generation)
+
+    def _latest_active_topic(
+        self,
+        session_id: str,
+        *,
+        generation: int,
+    ) -> SessionRetrievalTopic | None:
         return next(
             (
                 topic
@@ -1532,6 +1892,11 @@ def needs_current_information(query: str) -> bool:
     if _CURRENT_EVENT_QUERY.search(query) or _BROAD_NEWS_QUERY.search(query):
         return True
     if not _CURRENT_INFORMATION.search(query):
+        return False
+    if (
+        _COMPANION_SELF_QUERY.search(query)
+        and not _CURRENT_INFORMATION_SUBJECT.search(query)
+    ):
         return False
     if (
         _PERSONAL_TIME_STATEMENT.search(query)
@@ -1857,9 +2222,28 @@ _GROUNDING_GENERIC_TERMS = frozenset(
 )
 
 
+def _grounding_stem(token: str) -> str:
+    """Fold inflections and British spellings so paraphrases still match.
+
+    Applied identically to the reply and the evidence, so it can only make the
+    same word agree with itself ("withdrawing" and "withdraws"); it never lets
+    a new word through. Numbers are checked separately and stay exact.
+    """
+
+    stem = token.replace("our", "or") if len(token) > 5 else token
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(stem) > len(suffix) + 3 and stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    # "starring" -> "starr" -> "star", matching "stars" -> "star".
+    if len(stem) > 3 and stem[-1] == stem[-2] and stem[-1] not in "aeiou":
+        stem = stem[:-1]
+    return stem
+
+
 def _grounding_terms(value: str) -> frozenset[str]:
     return frozenset(
-        token.casefold()
+        _grounding_stem(token.casefold())
         for token in _TOPIC_TOKEN.findall(value)
         if len(token) >= 3
         and token.casefold() not in _TOPIC_STOP_WORDS
@@ -2077,6 +2461,86 @@ def _contains_helpdesk_language(response: str) -> bool:
     )
 
 
+class _HelpdeskSentenceFilter:
+    """Drop whole helpdesk sentences from a reply after its opening is emitted.
+
+    The prefix guard only vets the start of a reply, so a helpdesk sentence
+    later on ("Aanya. I'm here to listen and support you.") used to stream
+    straight through. Text is released a sentence at a time, which TTS waits
+    for anyway, so this adds no audio latency.
+    """
+
+    _SENTENCE_END = re.compile(r"[.!?…]+[\"')\]]*\s+")
+    _COMPLETE_ENDING = re.compile(
+        r"[.!?…][\"')\]\s‍️☀-➿\U0001f000-\U0001faff]*$"
+    )
+    _MAX_HELD_CHARACTERS = 180
+
+    def __init__(self, *, max_sentences: int | None = None) -> None:
+        self._pending = ""
+        self._released_any = False
+        self._released_sentences = 0
+        self._max_sentences = max_sentences
+
+    @property
+    def done(self) -> bool:
+        """The reply reached its sentence limit; the rest is never spoken."""
+
+        return (
+            self._max_sentences is not None
+            and self._released_sentences >= self._max_sentences
+        )
+
+    @staticmethod
+    def _keep(sentence: str) -> bool:
+        return not (
+            _contains_helpdesk_language(sentence)
+            or _DEPENDENCY_LANGUAGE.search(sentence)
+        )
+
+    def feed(self, text: str) -> str:
+        if self.done:
+            return ""
+        self._pending += text
+        released: list[str] = []
+        while not self.done:
+            match = self._SENTENCE_END.search(self._pending)
+            if match is None:
+                break
+            sentence = self._pending[: match.end()]
+            self._pending = self._pending[match.end():]
+            if self._keep(sentence):
+                released.append(sentence)
+                self._released_sentences += 1
+        if self.done:
+            self._pending = ""
+        # Never hold an unpunctuated run long enough to stall speech.
+        elif len(self._pending) > self._MAX_HELD_CHARACTERS:
+            remainder, self._pending = self._pending, ""
+            if self._keep(remainder):
+                released.append(remainder)
+        text_out = "".join(released)
+        if text_out.strip():
+            self._released_any = True
+        return text_out
+
+    def finish(self) -> str:
+        remainder, self._pending = self._pending, ""
+        if self.done or not self._keep(remainder):
+            return ""
+        stripped = remainder.strip()
+        # A final fragment cut off by the token budget ("...I didn't even
+        # realize it was the") would be spoken mid-thought; end on the last
+        # complete sentence instead.
+        if (
+            self._released_any
+            and len(stripped.split()) >= 4
+            and not self._COMPLETE_ENDING.search(stripped)
+        ):
+            return ""
+        return remainder
+
+
 def _could_be_helpdesk_language(response: str) -> bool:
     answer = _without_leading_acknowledgement(response)
     if not answer:
@@ -2094,6 +2558,103 @@ def _could_repeat_recent_response(
         _normalized_response(previous).startswith(answer)
         for previous in recent_responses
     )
+
+
+# Opening reactions, longest alternatives first so "oh wow" wins over "oh".
+_OPENING_REACTION = re.compile(
+    r"^\s*(?P<reaction>oh\s+wow|oh\s+nice|wait,?\s+seriously|wow|hmm+|yeah|yep|"
+    r"nice|haha|ooh|aww+|oh|okay|ok|really|mm+)(?![a-z])[\s,.!?…—-]*",
+    re.IGNORECASE,
+)
+
+
+def _opening_reaction(response: str) -> str | None:
+    match = _OPENING_REACTION.match(response)
+    if match is None:
+        return None
+    words = re.findall(r"[a-z]+", match.group("reaction").casefold())
+    # Stretched spellings are the same reaction: "hmmm" == "hmm".
+    return " ".join(re.sub(r"(.)\1{2,}", r"\1\1", word) for word in words)
+
+
+def _without_repeated_opening_reaction(
+    response: str, recent_responses: tuple[str, ...]
+) -> str:
+    """Drop an opening reaction that the previous reply already opened with.
+
+    Stripping is free, unlike rejecting the draft, which would cost another
+    model call on the voice path.
+    """
+
+    if not recent_responses:
+        return response
+    reaction = _opening_reaction(response)
+    if reaction is None or reaction != _opening_reaction(recent_responses[-1]):
+        return response
+    match = _OPENING_REACTION.match(response)
+    remainder = response[match.end():] if match is not None else response
+    if len(_TOPIC_TOKEN.findall(remainder)) < 2:
+        return response
+    return remainder[0].upper() + remainder[1:]
+
+
+# Dependency and exclusivity claims the product must never make (AGENTS.md),
+# e.g. "like a friend who's always there" from a live call.
+_DEPENDENCY_LANGUAGE = re.compile(
+    r"\b(?:(?:i'?ll|i\s+will|i'?m|i\s+am|who'?s|always)\s+)?always\s+"
+    r"(?:be\s+)?(?:there|here)(?:\s+for\s+you)?\b|"
+    r"\ball\s+you\s+(?:need|have)\b|\byou\s+only\s+(?:need|have)\s+me\b|"
+    r"\bonly\s+need\s+me\b|\bdon'?t\s+(?:ever\s+)?leave\s+me\b|"
+    r"\bnever\s+leave\s+(?:me|you)\b|\bi'?m\s+all\s+you\s+have\b",
+    re.IGNORECASE,
+)
+# Conversational replies are asked for one to three sentences; the model
+# sometimes runs to five (about 11 s of speech), so the limit is enforced.
+MAX_CONVERSATIONAL_SENTENCES = 3
+
+
+_REFERENCE_META = re.compile(
+    r"\b(?:the\s+)?(?:provided\s+|given\s+)?references?\b|"
+    r"\bno\s+(?:further\s+)?(?:information|details)\s+(?:is|are)\s+provided\b|"
+    r"\bsources?\s+(?:listed|provided|given)\b",
+    re.IGNORECASE,
+)
+
+
+_INSISTENCE_PREFIX = re.compile(
+    r"^(?:(?:no|okay|ok|so|but|great|please|hey|listen|again)\s+)*"
+    r"(?:i\s+(?:said|asked|mean)\s+)?"
+)
+
+
+def _restates_previous_question(user_query: str, previous: str) -> bool:
+    """True for an insisted repeat such as "I said what are you doing?"."""
+
+    current = _INSISTENCE_PREFIX.sub("", _normalized_response(user_query))
+    earlier = _INSISTENCE_PREFIX.sub("", _normalized_response(previous))
+    if len(current.split()) < 3 or len(earlier.split()) < 3:
+        return False
+    return current in earlier or earlier in current
+
+
+def _could_become_repeated_reaction(
+    response: str, recent_responses: tuple[str, ...]
+) -> bool:
+    """Hold streamed text until a repeated opening reaction can be stripped."""
+
+    if not recent_responses:
+        return False
+    previous = _opening_reaction(recent_responses[-1])
+    if previous is None:
+        return False
+    words = " ".join(re.findall(r"[a-z]+", response.casefold()))
+    if previous.startswith(words):
+        return True
+    if _opening_reaction(response) != previous:
+        return False
+    match = _OPENING_REACTION.match(response)
+    remainder = response[match.end():] if match is not None else ""
+    return len(_TOPIC_TOKEN.findall(remainder)) < 2
 
 
 def _response_prefix_needs_guarding(
@@ -2114,6 +2675,8 @@ def _response_prefix_needs_guarding(
     if not grounded and _could_be_helpdesk_language(response):
         return True
     if not grounded and _could_repeat_recent_response(response, recent_responses):
+        return True
+    if not grounded and _could_become_repeated_reaction(response, recent_responses):
         return True
     if user and (user.startswith(answer) or _is_obvious_echo(user_query, response)):
         return True

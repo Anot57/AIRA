@@ -33,6 +33,9 @@ BEAM_SIZE = int(
 )
 VAD_FILTER = True
 CONDITION_ON_PREVIOUS_TEXT = False
+# Bias decoding toward the companion's name, which base.en otherwise hears as
+# "Aria" or "Anya".
+HOTWORDS = "Aanya"
 DEFAULT_MODEL_DIR = Path("/mnt/e/aira-local-runtime/models/faster-whisper")
 DEFAULT_TRANSCRIPT_OUTPUT_DIR = Path(
     "/mnt/e/aira-local-runtime/generated/transcripts"
@@ -463,6 +466,7 @@ def transcribe_pcm16_audio(
                     beam_size=BEAM_SIZE,
                     vad_filter=VAD_FILTER,
                     condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                    hotwords=HOTWORDS,
                 )
                 raw_segments = list(segment_generator)
             else:
@@ -473,6 +477,7 @@ def transcribe_pcm16_audio(
                         beam_size=BEAM_SIZE,
                         vad_filter=VAD_FILTER,
                         condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                        hotwords=HOTWORDS,
                     )
                     raw_segments = list(segment_generator)
 
@@ -562,6 +567,7 @@ def transcribe_audio(
                     beam_size=BEAM_SIZE,
                     vad_filter=VAD_FILTER,
                     condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                    hotwords=HOTWORDS,
                 )
                 raw_segments = list(segment_generator)
             else:
@@ -572,6 +578,7 @@ def transcribe_audio(
                         beam_size=BEAM_SIZE,
                         vad_filter=VAD_FILTER,
                         condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                        hotwords=HOTWORDS,
                     )
                     raw_segments = list(segment_generator)
             segments = _normalize_segments(raw_segments)
@@ -700,6 +707,7 @@ def warmup_transcription_runtime(
                 beam_size=BEAM_SIZE,
                 vad_filter=VAD_FILTER,
                 condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                hotwords=HOTWORDS,
             )
             list(segments)
         except Exception as error:

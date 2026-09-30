@@ -319,6 +319,7 @@ class ReusableTranscriptionRuntimeTests(TranscriptionTestCase):
                 "beam_size": 1,
                 "vad_filter": True,
                 "condition_on_previous_text": False,
+                "hotwords": "Aanya",
             },
             fake_model.transcribe.call_args_list[0].kwargs,
         )
