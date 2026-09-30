@@ -480,6 +480,127 @@ The diagnostic prints the client-observed first binary arrival and the server's
 It uses only the standard library and performs real STT, LLM, and TTS; do not run
 it as part of automated tests.
 
+## Live test runbook
+
+Start the processes in this order, each in its own terminal. All model
+services stay on loopback; only the Aira API listens on the LAN.
+
+**1. Pocket TTS worker (Windows PowerShell).** Use the command in
+[Pocket TTS realtime worker](#pocket-tts-realtime-worker), then confirm
+`curl http://127.0.0.1:8766/ready` returns 200.
+
+**2. llama-server on the GPU (Windows PowerShell).** The WSL llama.cpp build
+has no CUDA backend, so the GPU server is the official Windows CUDA 12.4 build
+of the same release (b10715), unpacked to
+`E:\aira-local-runtime\llama-win-cuda-b10715`. WSL reaches it on loopback, like
+the Pocket worker.
+
+```powershell
+& "E:\aira-local-runtime\llama-win-cuda-b10715\llama-server.exe" `
+  --model "E:\aira-local-runtime\models\llm\Qwen3-4B-Instruct-2507-Q4_K_M.gguf" `
+  --host 127.0.0.1 --port 8767 --offline --n-gpu-layers 99 `
+  --flash-attn on --jinja --reasoning off --reasoning-budget 0 `
+  --ctx-size 4096 --n-predict 256 --parallel 1
+```
+
+The model is Qwen3-4B-Instruct-2507 (Q4_K_M, 2.5 GB, from
+`unsloth/Qwen3-4B-Instruct-2507-GGUF`, SHA-256
+`3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`). On the
+strict conversation evaluation it had 1 failure in 48 cases against 3 for
+Qwen3-1.7B, and it answers the question asked instead of deflecting. It
+generates about 70 tokens/s on the RTX 2070 Max-Q (1.7B: about 124). To fall
+back to 1.7B, use the model blob
+`E:\aira-local-runtime\llama-cache\models--ggml-org--Qwen3-1.7B-GGUF\blobs\d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5`
+(the `snapshots` entry is a WSL symlink that Windows programs cannot follow).
+`--n-gpu-layers 99` puts
+every layer on the GPU. `--n-predict` is a server-side ceiling on every
+request, so it must be at least the largest per-request budget
+(`BROAD_NEWS_LLM_MAX_TOKENS`, 208); the older value of 56 silently truncated
+grounded answers. `--ctx-size 4096` leaves room for the companion system
+prompt, retrieval references, and session history. Flash attention removed a
+multi-second stall on the first request after start-up.
+
+Measured on the RTX 2070 Max-Q (running on battery), with Aanya's system
+prompt cached: new-question prompt processing 46-57 ms on the GPU versus
+295-359 ms on the CPU build, and generation about 29 tokens/s versus 13.5.
+Plug the laptop in for testing; on battery the driver throttles the GPU.
+
+**3. SearXNG (WSL Docker).** The `aira-searxng` container serves JSON search on
+loopback:
+
+```bash
+docker start aira-searxng
+curl -s "http://127.0.0.1:8888/search?q=test&format=json" | head -c 200
+```
+
+**4. Aira API (WSL).**
+
+```bash
+cd /mnt/e/female-voice-ai
+source /mnt/e/aira-local-runtime/activate.sh
+# CUDA libraries for Faster-Whisper ship as pip wheels inside the venv.
+SP=$(python -c "import site; print(site.getsitepackages()[0])")
+export LD_LIBRARY_PATH="$SP/nvidia/cublas/lib:$SP/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+AIRA_STT_DEVICE=cuda \
+AIRA_STT_COMPUTE_TYPE=float16 \
+AIRA_REALTIME_TTS_PROVIDER=pocket_worker \
+AIRA_POCKET_TTS_WORKER_URL=http://127.0.0.1:8766 \
+AIRA_REALTIME_LLM_PROVIDER=llama_server \
+AIRA_LLAMA_SERVER_URL=http://127.0.0.1:8767 \
+AIRA_REALTIME_STT_CONCURRENCY=1 \
+AIRA_ASYNC_RETRIEVAL=1 \
+AIRA_SEARCH_PROVIDER=searxng \
+AIRA_SEARXNG_URL=http://127.0.0.1:8888 \
+AIRA_SEARCH_TIMEOUT_SECONDS=3 \
+AIRA_SEARCH_NEWS_ENGINES= \
+AIRA_NEWS_PROVIDER=google_news_rss \
+AIRA_DEBUG_CONVERSATION=1 \
+AIRA_MODEL_WARMUP=1 \
+python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 18765
+```
+
+`AIRA_STT_DEVICE=cuda` moves Faster-Whisper to the GPU; on an RTX 2070 Max-Q
+it measured 405 ms warm for a 6.8 s clip versus 1,167 ms on CPU int8.
+`AIRA_ASYNC_RETRIEVAL=1` enables session history, follow-up context, and the
+repeated-reaction guard. On this network Google News is CAPTCHA-suspended and
+the other news engines are unresponsive, so `AIRA_SEARCH_NEWS_ENGINES=` (empty)
+skips that pass and gives news the whole `AIRA_SEARCH_TIMEOUT_SECONDS` budget
+for general search, which measured 0.9-1.6 s. `AIRA_NEWS_PROVIDER=google_news_rss`
+answers news questions from Google News RSS headlines (free, no key,
+0.1-0.9 s) instead of section front pages that contain no facts; set
+`AIRA_NEWS_REGION` (default `IN`) for the edition. News questions are sent to
+Google, so leave it unset if that is not acceptable. Non-news lookups and feed
+failures fall back to SearXNG. `AIRA_DEBUG_CONVERSATION=1` prints transcripts to this
+local terminal only; leave it off whenever anyone else's voice is involved.
+
+**5. Measure.** Once `curl http://127.0.0.1:18765/ready` returns 200:
+
+```bash
+python services/local_voice_api/tools/smoke_realtime_websocket.py \
+  /mnt/e/aira-local-runtime/input/amman_test.wav \
+  /mnt/e/aira-local-runtime/generated/realtime-smoke-output.wav \
+  --url ws://127.0.0.1:18765/v1/realtime
+python services/local_voice_api/tools/aanya_conversation_regression.py
+```
+
+The smoke test reports server-side stage timings (`ttfa_ms` and friends); the
+regression harness exercises conversation quality and grounded retrieval
+without audio.
+
+**6. Phone.** Build with the server address (the PC's LAN IP on :18765, or
+the Tailscale address on :8765 when Tailscale Serve forwards it), and add the
+barge-in flag only for the echo test:
+
+```bash
+flutter build apk --debug --dart-define=AIRA_API_BASE_URL=http://<pc-lan-ip>:18765
+flutter build apk --debug --dart-define=AIRA_API_BASE_URL=http://<pc-lan-ip>:18765 \
+  --dart-define=AIRA_BARGE_IN=true
+```
+
+With barge-in on, the microphone stays open (with Android echo cancellation)
+while Aanya speaks. If her own voice interrupts her on speaker, keep the flag
+off and report the device model; playback routing is not changed yet.
+
 ## Lightweight verification
 
 These checks use only the Python standard library and never import the model
