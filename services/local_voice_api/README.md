@@ -500,7 +500,7 @@ the Pocket worker.
   --model "E:\aira-local-runtime\models\llm\Qwen3-4B-Instruct-2507-Q4_K_M.gguf" `
   --host 127.0.0.1 --port 8767 --offline --n-gpu-layers 99 `
   --flash-attn on --jinja --reasoning off --reasoning-budget 0 `
-  --ctx-size 4096 --n-predict 256 --parallel 1
+  --ctx-size 8192 --n-predict 256 --parallel 2
 ```
 
 The model is Qwen3-4B-Instruct-2507 (Q4_K_M, 2.5 GB, from
@@ -516,8 +516,12 @@ back to 1.7B, use the model blob
 every layer on the GPU. `--n-predict` is a server-side ceiling on every
 request, so it must be at least the largest per-request budget
 (`BROAD_NEWS_LLM_MAX_TOKENS`, 208); the older value of 56 silently truncated
-grounded answers. `--ctx-size 4096` leaves room for the companion system
-prompt, retrieval references, and session history. Flash attention removed a
+grounded answers. `--parallel 2` gives the search router (below) its own slot,
+so its short system prompt does not evict Aanya's cached prompt; `--ctx-size
+8192` is split across the slots, leaving each one 4096 tokens for the
+companion system prompt, retrieval references, and session history. If the
+GPU becomes unstable, `--ctx-size 4096 --parallel 1` still works and costs
+about 50 ms of prompt processing per turn. Flash attention removed a
 multi-second stall on the first request after start-up.
 
 Measured on the RTX 2070 Max-Q (running on battery), with Aanya's system
@@ -570,7 +574,12 @@ answers news questions from Google News RSS headlines (free, no key,
 0.1-0.9 s) instead of section front pages that contain no facts; set
 `AIRA_NEWS_REGION` (default `IN`) for the edition. News questions are sent to
 Google, so leave it unset if that is not acceptable. Non-news lookups and feed
-failures fall back to SearXNG. `AIRA_DEBUG_CONVERSATION=1` prints transcripts to this
+failures fall back to SearXNG. With the llama-server provider, a search router
+asks the model (74-227 ms) whether a question needs the web, so users do not
+have to say "news" or "today": it returns a search query for current or
+real-world facts and skips small talk, flirting, and stable knowledge. Set
+`AIRA_SEARCH_ROUTER=0` to fall back to keyword routing only.
+`AIRA_DEBUG_CONVERSATION=1` prints transcripts to this
 local terminal only; leave it off whenever anyone else's voice is involved.
 
 **5. Measure.** Once `curl http://127.0.0.1:18765/ready` returns 200:

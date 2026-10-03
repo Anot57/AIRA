@@ -24,7 +24,9 @@ from .pocket_tts import PocketTtsWorkerConfig, PocketTtsWorkerSynthesizer
 from .realtime_pipeline import RealtimeTurnProcessor, StreamingRealtimeTurnProcessor
 from .realtime_protocol import PcmAudioFormat
 from .retrieval import (
+    SEARCH_ROUTER_PROMPT,
     AsyncRetrievalLanguageModel,
+    LanguageModelSearchRouter,
     RetrievalAugmentedLanguageModel,
     retrieval_provider_from_environment,
 )
@@ -48,6 +50,7 @@ from .transcription import (
 REALTIME_LLM_PROVIDER_ENVIRONMENT = "AIRA_REALTIME_LLM_PROVIDER"
 REALTIME_STT_CONCURRENCY_ENVIRONMENT = "AIRA_REALTIME_STT_CONCURRENCY"
 ASYNC_RETRIEVAL_ENVIRONMENT = "AIRA_ASYNC_RETRIEVAL"
+SEARCH_ROUTER_ENVIRONMENT = "AIRA_SEARCH_ROUTER"
 
 
 def _realtime_llm_provider(
@@ -103,6 +106,10 @@ def build_pocket_realtime_processor_factory(
     )
     retrieval_provider = retrieval_provider_from_environment(environ)
     async_retrieval = _async_retrieval_enabled(environ)
+    search_router_enabled = (
+        source.get(SEARCH_ROUTER_ENVIRONMENT, "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+    )
     debug_conversation = debug_conversation_enabled(environ)
 
     def create_processor() -> RealtimeTurnProcessor:
@@ -117,8 +124,24 @@ def build_pocket_realtime_processor_factory(
                 _generate_response
             )
 
+        # The model decides when a question needs the internet, so users do
+        # not have to say "news" or "today" (llama-server only: it shares the
+        # warm GPU model; llama-cli is too slow for an extra call per turn).
+        router = (
+            LanguageModelSearchRouter(
+                LlamaServerStreamingLanguageModel(
+                    llama_server_config,
+                    system_persona=SEARCH_ROUTER_PROMPT,
+                    max_tokens=24,
+                )
+            )
+            if llama_server_config is not None and search_router_enabled
+            else None
+        )
         retrieval_language_model = (
-            AsyncRetrievalLanguageModel(language_model, retrieval_provider)
+            AsyncRetrievalLanguageModel(
+                language_model, retrieval_provider, router=router
+            )
             if async_retrieval
             else RetrievalAugmentedLanguageModel(
                 language_model, retrieval_provider
