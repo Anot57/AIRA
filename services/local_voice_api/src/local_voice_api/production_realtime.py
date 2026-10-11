@@ -31,6 +31,7 @@ from .retrieval import (
     retrieval_provider_from_environment,
 )
 from .safety import CrisisEscalatingLanguageModel
+from .story_details import story_details_from_environment
 from .streaming import (
     BoundedBatchStreamingTranscriber,
     CompleteResponseStreamingLlmAdapter,
@@ -105,6 +106,7 @@ def build_pocket_realtime_processor_factory(
         else None
     )
     retrieval_provider = retrieval_provider_from_environment(environ)
+    story_details = story_details_from_environment(environ)
     async_retrieval = _async_retrieval_enabled(environ)
     search_router_enabled = (
         source.get(SEARCH_ROUTER_ENVIRONMENT, "1").strip().casefold()
@@ -140,7 +142,10 @@ def build_pocket_realtime_processor_factory(
         )
         retrieval_language_model = (
             AsyncRetrievalLanguageModel(
-                language_model, retrieval_provider, router=router
+                language_model,
+                retrieval_provider,
+                router=router,
+                story_details=story_details,
             )
             if async_retrieval
             else RetrievalAugmentedLanguageModel(

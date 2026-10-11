@@ -123,6 +123,21 @@ class PersonaPromptTests(unittest.TestCase):
         self.assertIn("never encourage emotional dependency or exclusivity", safety)
         self.assertIn("needs only you or must not leave", safety)
         self.assertIn("withdraw from other people", safety)
+        # Live call 2026-10-11: "It makes my quiet moments feel like they're
+        # not alone."
+        self.assertIn("makes you feel safe, complete, or less alone", safety)
+        self.assertIn("lonely without them", safety)
+
+    def test_companions_never_claim_to_hear_the_users_voice(self) -> None:
+        # Live call 2026-10-11: "How do you like my voice?" got "It's warm and
+        # gentle", but only the transcript reaches the model.
+        for companion_id in PERSONAS:
+            prompt = build_system_prompt(companion_id)
+            with self.subTest(companion=companion_id):
+                self.assertIn(
+                    "You only get the user's words as text; never describe their voice.",
+                    prompt,
+                )
 
     def test_core_mode_allows_invited_romance_but_stays_non_graphic(self) -> None:
         prompt = build_system_prompt("maya").casefold()

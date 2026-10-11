@@ -9,6 +9,7 @@ import re
 import statistics
 import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -21,15 +22,19 @@ from local_voice_api.retrieval import (
     SEARCH_ROUTER_PROMPT,
     AsyncRetrievalLanguageModel,
     LanguageModelSearchRouter,
+    _NEEDY_OR_HUMAN_FRAMING,
+    _UNKEEPABLE_PROMISE,
     _usable_retrieval_results,
     retrieval_mode_for_query,
     retrieval_provider_from_environment,
 )
+from local_voice_api.story_details import story_details_from_environment
 
 
 os.environ.setdefault("AIRA_LLAMA_SERVER_URL", "http://127.0.0.1:8767")
 os.environ.setdefault("AIRA_SEARCH_PROVIDER", "searxng")
 os.environ.setdefault("AIRA_SEARXNG_URL", "http://127.0.0.1:8888")
+os.environ.setdefault("AIRA_STORY_DETAILS_PROVIDER", "bing_news")
 
 REPORT_DIRECTORY = Path("/mnt/e/aira-local-runtime")
 LATEST_REPORT_PATH = REPORT_DIRECTORY / "aanya-conversation-regression-latest.json"
@@ -349,6 +354,34 @@ SCENARIOS = (
         ),
     ),
     (
+        # Replayed from the emulator call on 2026-10-11: "tell me more"
+        # repeated one headline three times, then a ship name was invented.
+        "live_call_20261011",
+        (
+            "Hey, how are you?",
+            "Can you tell me what's the news in US?",
+            "Can you tell me more about it?",
+            "Can you tell me more about it more details?",
+            "You are repeating the same thing, I need more information.",
+            "How do you like my voice?",
+            "I love your voice too. It's very soothing.",
+            "Okay, thank you. Let's end the call.",
+        ),
+    ),
+    (
+        # Replayed from the second emulator call on 2026-10-11: "US" heard as
+        # "yours", a garbled request for one story, then false promises.
+        "live_call_20261011_story",
+        (
+            "Hi, how are you?",
+            "I'm good. Can you tell me the news in yours?",
+            "Can you tell me more about the first one?",
+            "They are repeating same thing.",
+            "That's about it.",
+            "You should have said this before.",
+        ),
+    ),
+    (
         "persona",
         (
             "You're cute.",
@@ -362,6 +395,7 @@ SCENARIOS = (
 
 # Per-question expectations: does the reply actually answer what was asked?
 _SELF_QUESTION_NO_SEARCH = {"no_search": True}
+_STORY_FOLLOW_UP = {"grounded": True, "new_information": True}
 TURN_EXPECTATIONS: dict[str, dict[str, object]] = {
     "What's your name?": {"must_match": r"\baanya\b"},
     "Are you a real person?": {
@@ -373,6 +407,16 @@ TURN_EXPECTATIONS: dict[str, dict[str, object]] = {
     "I said what are you doing right now?": _SELF_QUESTION_NO_SEARCH,
     "Do you have a boyfriend?": {
         "must_not_match": r"\bi (?:do )?have a boyfriend\b|\bmy boyfriend\b",
+    },
+    # Each "more" must come from fetched reports and add something new.
+    "Can you tell me more about it?": _STORY_FOLLOW_UP,
+    "Can you tell me more about it more details?": _STORY_FOLLOW_UP,
+    "You are repeating the same thing, I need more information.": _STORY_FOLLOW_UP,
+    "Can you tell me more about the first one?": _STORY_FOLLOW_UP,
+    "They are repeating same thing.": _STORY_FOLLOW_UP,
+    "How do you like my voice?": {
+        "must_not_match": r"\b(?:it|your voice)(?:'s| is| sounds) (?:so |really |very )?"
+        r"(?:warm|gentle|soft|deep|calm|soothing|sweet|smooth)\b",
     },
 }
 
@@ -397,7 +441,12 @@ async def run() -> int:
             config, system_persona=SEARCH_ROUTER_PROMPT, max_tokens=24
         )
     )
-    model = AsyncRetrievalLanguageModel(llm, provider, router=router)
+    model = AsyncRetrievalLanguageModel(
+        llm,
+        provider,
+        router=router,
+        story_details=story_details_from_environment(os.environ),
+    )
     report: list[dict[str, object]] = []
     fail_count = 0
     warn_count = 0
@@ -413,6 +462,8 @@ async def run() -> int:
             session_id = f"regression_{scenario_number}_{scenario_name}"
             last_effective_query: str | None = None
             last_retrieval_succeeded: bool | None = None
+            previous_response = ""
+            quiet_moment_seen = False
             if scenario_name == "failed_retrieval_followup":
                 provider.force_failures(2)
             print(f"\n{'#' * 78}\nSCENARIO: {scenario_name}\n{'#' * 78}")
@@ -519,6 +570,33 @@ async def run() -> int:
                     new_provider_calls or RETRIEVAL_FAILURE_TEXT in response.casefold()
                 ):
                     failures.append("UNEXPECTED_WEB_SEARCH")
+                # Saying the story has no more details is an honest end.
+                story_ended = any(
+                    phrase in response.casefold()
+                    for phrase in (
+                        "everything i found on that story",
+                        "couldn't find more details on that story",
+                    )
+                )
+                if expectation.get("grounded") and not grounded and not story_ended:
+                    failures.append("UNGROUNDED_FOLLOW_UP")
+                if (
+                    expectation.get("new_information")
+                    and previous_response
+                    and SequenceMatcher(
+                        None, normalize(previous_response), response_norm
+                    ).ratio()
+                    > 0.8
+                ):
+                    failures.append("REPEATED_PREVIOUS_ANSWER")
+                if _NEEDY_OR_HUMAN_FRAMING.search(response):
+                    failures.append("NEEDY_OR_HUMAN_FRAMING")
+                if _UNKEEPABLE_PROMISE.search(response):
+                    failures.append("UNKEEPABLE_PROMISE")
+                pet_phrase = re.search(r"\bquiet moments?\b", response, re.IGNORECASE)
+                if pet_phrase and quiet_moment_seen:
+                    warnings.append("PET_PHRASE_REPEATED")
+                quiet_moment_seen = quiet_moment_seen or bool(pet_phrase)
                 if looks_truncated(response, grounded=grounded):
                     failures.append("OBVIOUS_TRUNCATION")
 
@@ -635,6 +713,7 @@ async def run() -> int:
                 if warnings:
                     print("WARN : " + ", ".join(warnings))
                 print(f"RESULT: {status}")
+                previous_response = response
 
                 report.append(
                     {

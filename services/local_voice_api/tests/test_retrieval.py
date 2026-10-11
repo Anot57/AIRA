@@ -18,6 +18,8 @@ sys.path.insert(0, str(SOURCE_ROOT))
 
 from local_voice_api.retrieval import (  # noqa: E402
     MAX_BROAD_NEWS_RESULTS,
+    MAX_STORY_DETAIL_RESULTS,
+    MAX_STORY_PASSAGES,
     MAX_RETRIEVAL_CONTEXT_CHARACTERS,
     MAX_RETRIEVAL_RESULTS,
     MAX_SPECIFIC_RETRIEVAL_RESULTS,
@@ -31,13 +33,19 @@ from local_voice_api.retrieval import (  # noqa: E402
     LanguageModelSearchRouter,
     NewsFeedRetrievalProvider,
     _DEPENDENCY_LANGUAGE,
+    _FABRICATED_PHYSICAL,
+    _NEEDY_OR_HUMAN_FRAMING,
+    _UNKEEPABLE_PROMISE,
+    _adds_new_detail,
     _could_become_repeated_reaction,
+    _novelty_terms,
     _grounded_sentence_supported,
     google_news_feed_url,
     is_news_lookup,
     news_search_terms,
     parse_news_feed,
     _retrieval_prompt,
+    _story_search_query,
     _without_repeated_opening_reaction,
     is_broad_news_query,
     needs_current_information,
@@ -86,6 +94,105 @@ class _Provider:
         if self.error is not None:
             raise self.error
         return self.results
+
+
+class _NewsThenStoryProvider(_Provider):
+    """Headlines for news questions, detailed reports for anything else."""
+
+    def __init__(
+        self,
+        headlines: tuple[RetrievalResult, ...],
+        details: tuple[RetrievalResult, ...],
+    ) -> None:
+        super().__init__()
+        self.headlines = headlines
+        self.details = details
+
+    async def search(self, query: str, *, medical: bool, limit: int):
+        self.calls.append((query, medical, limit))
+        return self.headlines if is_news_lookup(query) else self.details
+
+
+_BLOCKADE_HEADLINES = (
+    RetrievalResult(
+        "US military says it disabled cargo vessel trying to run Iran blockade",
+        "https://www.reuters.com/world/us-military-disabled-cargo-vessel",
+        "Reuters",
+        engine="google news rss",
+    ),
+    RetrievalResult(
+        "Fires lit on streets across France after student protests",
+        "https://www.bbc.com/news/world-france",
+        "BBC",
+        engine="google news rss",
+    ),
+)
+_BLOCKADE_DETAILS = (
+    RetrievalResult(
+        "US military says it disabled cargo vessel trying to run Iran blockade",
+        "https://www.reuters.com/world/us-military-disabled-cargo-vessel",
+        "The US military said on Saturday it had disabled a commercial cargo "
+        "vessel in the Gulf of Oman after the ship's crew ignored warnings.",
+    ),
+    RetrievalResult(
+        "US forces disable ship attempting to run Iran blockade in Gulf of Oman",
+        "https://www.aljazeera.com/news/us-forces-disable-ship",
+        "A US military jet struck the stern of the commercial cargo ship "
+        "without harming the crew, CENTCOM says.",
+    ),
+    RetrievalResult(
+        "US Forces Disable Cargo Vessel Attempting to Violate Blockade",
+        "https://www.centcom.mil/media/press-releases",
+        "CENTCOM forces resumed the blockade against all ships entering or "
+        "departing Iranian ports on July 14.",
+    ),
+)
+_BLOCKADE_ARTICLE = (
+    RetrievalResult(
+        "US military disables cargo vessel attempting to bypass Iran blockade",
+        "https://www.firstpost.com/world/us-military-disables-cargo-vessel",
+        "A US military fighter jet struck the stern of the Panama-flagged M/V "
+        "Ocean Molica with a precision munition, fully disabling the vessel.",
+        engine="news article",
+    ),
+)
+
+
+class _StorySource:
+    def __init__(
+        self,
+        passages: tuple[RetrievalResult, ...],
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.passages = passages
+        self.error = error
+        self.calls: list[tuple[str, int]] = []
+
+    async def details(self, headline: str, *, limit: int):
+        self.calls.append((headline, limit))
+        if self.error is not None:
+            raise self.error
+        return self.passages
+
+
+class _KeyedStoryProvider(_Provider):
+    """Headlines for news questions, each story's own reports otherwise."""
+
+    def __init__(
+        self,
+        headlines: tuple[RetrievalResult, ...],
+        details: dict[str, tuple[RetrievalResult, ...]],
+    ) -> None:
+        super().__init__()
+        self.headlines = headlines
+        self.details = details
+
+    async def search(self, query: str, *, medical: bool, limit: int):
+        self.calls.append((query, medical, limit))
+        if is_news_lookup(query):
+            return self.headlines
+        return self.details.get(query, ())
 
 
 class _UnusedGeneral:
@@ -1304,6 +1411,66 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Octopuses have three hearts.", reply.strip())
         await model.close()
 
+    async def test_reply_cut_off_after_an_abbreviation_is_not_spoken(self) -> None:
+        # Live call 2026-10-11: the budget ended the reply on "The U.S.",
+        # which counted as a complete sentence and was spoken.
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Octopuses have three hearts.",
+                    " The U.S.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Tell me something interesting.")
+
+        self.assertEqual("Octopuses have three hearts.", reply.strip())
+        await model.close()
+
+    async def test_real_sentence_ending_in_an_abbreviation_is_spoken(self) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Oh nice, Texas is huge.",
+                    " Lots of people move to the U.S.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "I just moved to Texas.")
+
+        self.assertEqual(
+            "Oh nice, Texas is huge. Lots of people move to the U.S.",
+            reply.strip(),
+        )
+        await model.close()
+
+    async def test_abbreviations_do_not_end_sentences(self) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "The U.S. Navy runs research ships.",
+                    " Dr. Rao studies octopuses.",
+                    " They have three hearts.",
+                    " Two stop while they swim.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Tell me something interesting.")
+
+        # Three real sentences fit the limit; "U.S." and "Dr." are not breaks.
+        self.assertEqual(
+            "The U.S. Navy runs research ships. Dr. Rao studies octopuses. "
+            "They have three hearts.",
+            reply.strip(),
+        )
+        await model.close()
+
     async def test_repeated_question_gets_the_real_answer_not_go_on(self) -> None:
         # Found in the Qwen3-4B evaluation: an insisted question got the same
         # good answer twice, and the repeat guard replaced it with "Go on."
@@ -1412,6 +1579,212 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         for sentence in healthy:
             with self.subTest(sentence=sentence):
                 self.assertIsNone(_DEPENDENCY_LANGUAGE.search(sentence))
+
+    def test_needy_or_human_framing_is_detected(self) -> None:
+        # Live call 2026-10-11.
+        claims = (
+            "It's warm and gentle—like a quiet moment shared between two people.",
+            "I enjoy how it makes me feel safe and heard.",
+            "It makes my quiet moments feel like they're not alone.",
+            "I'm so lonely without you.",
+            "I see—let me dig a bit deeper.",
+            "Your voice sounds so soothing.",
+        )
+        for claim in claims:
+            with self.subTest(claim=claim):
+                self.assertIsNotNone(_NEEDY_OR_HUMAN_FRAMING.search(claim))
+        healthy = (
+            "You're not alone in feeling that way.",
+            "That means a lot to me.",
+            "I love hearing what you have to say.",
+            "Your words made me smile.",
+            "Being alone sometimes is healthy.",
+            "Two people can disagree and still be friends.",
+            "I'm not alone in thinking that.",
+        )
+        for sentence in healthy:
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(_NEEDY_OR_HUMAN_FRAMING.search(sentence))
+
+    async def test_needy_sentence_is_dropped_from_a_compliment_reply(self) -> None:
+        # Live call 2026-10-11: "I love your voice too. It's very soothing."
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "That means a lot to me.",
+                    " It makes my quiet moments feel like they're not alone.",
+                    " Thanks for sharing that with me.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "I love your voice too. It's very soothing.")
+
+        self.assertNotIn("not alone", reply)
+        self.assertIn("That means a lot to me.", reply)
+        await model.close()
+
+    def test_unkeepable_promises_are_detected(self) -> None:
+        # Live call 2026-10-11: she exists only during the call.
+        promises = (
+            "I'll keep an eye out for new ones if anything comes up.",
+            "I'll keep listening and sharing what I find.",
+            "I'll let you know when there's news.",
+            "I will check back later.",
+            "I'll remind you tomorrow.",
+            "I'll get back to you on that.",
+        )
+        for promise in promises:
+            with self.subTest(promise=promise):
+                self.assertIsNotNone(_UNKEEPABLE_PROMISE.search(promise))
+        fine = (
+            "Let me know if anything changes.",
+            "I'll keep that in mind while we talk.",
+            "I'm listening.",
+            "I'll keep you company for a bit.",
+            "I love sharing what I find interesting.",
+        )
+        for sentence in fine:
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(_UNKEEPABLE_PROMISE.search(sentence))
+
+    async def test_unkeepable_promise_is_never_spoken(self) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Alright, that was the main story.",
+                    " I'll keep an eye out for new ones if anything comes up.",
+                ),
+                ("Alright, that was the main story.",),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "That's about it.")
+
+        self.assertNotIn("keep an eye", reply)
+        self.assertIn("that was the main story", reply)
+        await model.close()
+
+    def test_reader_call_outs_are_not_read_as_news(self) -> None:
+        # Live call 2026-10-11 read these out as "the latest headlines".
+        feed = (
+            b'<?xml version="1.0"?><rss><channel>'
+            b"<item><title>Your photos: Curious cows, striking sunsets and autumn "
+            b"fungi - BBC</title><link>https://news.google.com/rss/articles/a</link>"
+            b'<source url="https://www.bbc.com">BBC</source></item>'
+            b"<item><title>Send us your questions for economist Isabella Weber on "
+            b"inflation - The Guardian</title>"
+            b"<link>https://news.google.com/rss/articles/b</link>"
+            b'<source url="https://www.theguardian.com">The Guardian</source></item>'
+            b"<item><title>US military says it disabled cargo vessel trying to run "
+            b"Iran blockade - Reuters</title>"
+            b"<link>https://news.google.com/rss/articles/c</link>"
+            b'<source url="https://www.reuters.com">Reuters</source></item>'
+            b"</channel></rss>"
+        )
+
+        results = parse_news_feed(feed, limit=6)
+
+        self.assertEqual(
+            ["US military says it disabled cargo vessel trying to run Iran blockade"],
+            [result.title for result in results],
+        )
+
+    def test_misheard_us_as_yours_is_not_a_search_word(self) -> None:
+        # Live call 2026-10-11: "the news in yours" searched Google News for
+        # "yours" and found only reader call-outs.
+        question = "Can you tell me the news in yours?"
+
+        self.assertEqual((), news_search_terms(question))
+        self.assertNotIn("/search?", google_news_feed_url(question, region="IN"))
+
+    async def test_router_warmup_does_not_delay_the_call_and_can_finish(
+        self,
+    ) -> None:
+        class _SlowRouterModel:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def stream(self, transcript: str, cancel_event: threading.Event):
+                self.prompts.append(transcript)
+                await asyncio.sleep(0.2)
+                yield "CHAT"
+
+        router_model = _SlowRouterModel()
+        model = AsyncRetrievalLanguageModel(
+            _PromptLanguageModel(),
+            _Provider(),
+            router=LanguageModelSearchRouter(router_model, timeout_seconds=0.05),
+        )
+
+        started = asyncio.get_running_loop().time()
+        await model.prepare()
+
+        # Live calls 2026-10-11: the warm-up hit the 1.5 s question limit every
+        # time. It now runs in the background with a longer limit.
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.15)
+        with self.assertNoLogs("local_voice_api.retrieval", level="WARNING"):
+            await asyncio.wait_for(asyncio.shield(model._router_warmup), timeout=2)
+        self.assertEqual(1, len(router_model.prompts))
+        await model.close()
+
+    async def test_voice_question_gets_an_honest_answer(self) -> None:
+        # Live calls 2026-10-11: "How do you like my voice?" got "It's gentle
+        # and warm—just like you", but only the transcript reaches her.
+        description = ("It's gentle and warm—just like you.", " I enjoy listening to it.")
+        local = _ChunkedScriptedLanguageModel((description, description))
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "How do you like my voice?")
+
+        self.assertNotIn("warm", reply)
+        self.assertIn("can't actually hear your voice", reply)
+        await model.close()
+
+    async def test_invented_news_facts_are_not_spoken_in_small_talk(self) -> None:
+        # Live replay 2026-10-11: "You should have said this before." got made-up
+        # background ("the movement started as a grassroots effort, mostly
+        # online") about the story just discussed.
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("US military says it disabled cargo vessel trying to run Iran blockade.",),
+                (
+                    "I should have mentioned that the cargo vessel was carrying "
+                    "weapons and fuel for militant groups in Yemen.",
+                    " That must be a scary situation for the crew.",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider(_BLOCKADE_HEADLINES))
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        reply = await _collect_turn(
+            model, "You should have said this before.", generation=2
+        )
+
+        self.assertNotIn("weapons", reply)
+        self.assertIn("scary situation", reply)
+        self.assertIn("Never add news facts", local.prompts[-1])
+        await model.close()
+
+    async def test_close_cancels_a_hanging_router_warmup(self) -> None:
+        class _HangingRouterModel:
+            async def stream(self, transcript: str, cancel_event: threading.Event):
+                await asyncio.sleep(30)
+                yield "CHAT"
+
+        model = AsyncRetrievalLanguageModel(
+            _PromptLanguageModel(),
+            _Provider(),
+            router=LanguageModelSearchRouter(_HangingRouterModel()),
+        )
+        await model.prepare()
+
+        await asyncio.wait_for(model.close(), timeout=1)
+
+        self.assertTrue(model._router_warmup.done())
 
     async def test_exclusivity_claim_is_never_spoken(self) -> None:
         # Live run 2026-10-03: "No, I don't have a boyfriend—just you."
@@ -1673,6 +2046,379 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("why news", searched)
         await model.close()
+
+    async def test_tell_me_more_moves_through_the_story_without_repeating(
+        self,
+    ) -> None:
+        # Live calls 2026-10-11: every "tell me more" repeated the one-line
+        # headline, then "I need more information" invented a ship name.
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        local = _PromptLanguageModel()
+        model = AsyncRetrievalLanguageModel(local, provider)
+
+        first = await _collect_turn(
+            model, "Can you tell me what's the news in US?", generation=1
+        )
+        second = await _collect_turn(
+            model, "Can you tell me more about it?", generation=2
+        )
+
+        self.assertIn("Iran blockade", first)
+        self.assertEqual(
+            (
+                "US military says it disabled cargo vessel trying to run Iran "
+                "blockade",
+                False,
+                MAX_STORY_DETAIL_RESULTS,
+            ),
+            provider.calls[1],
+        )
+        self.assertIn("Gulf of Oman", second)
+        story_prompt = local.prompts[-1]
+        self.assertIn("Already told: ", story_prompt)
+        self.assertIn("Never repeat anything under Already told", story_prompt)
+        self.assertIn("2-3 short, complete spoken sentences", story_prompt)
+
+        third = await _collect_turn(
+            model, "Can you tell me more about it more details?", generation=3
+        )
+        fourth = await _collect_turn(
+            model,
+            "You are repeating the same thing, I need more information.",
+            generation=4,
+        )
+
+        # Each "more" is the next report, never one already told, and the
+        # fetched reports are reused without searching again.
+        self.assertIn("jet struck the stern", third)
+        self.assertNotIn("Gulf of Oman", third)
+        self.assertIn("July 14", fourth)
+        self.assertNotIn("stern", fourth)
+        self.assertNotIn("Gulf of Oman", local.prompts[-1].split("<refs>", 1)[1])
+        self.assertEqual(2, len(provider.calls))
+
+        prompts_before = len(local.prompts)
+        fifth = await _collect_turn(model, "Tell me more about it.", generation=5)
+
+        # When the reports run out she says so instead of starting over.
+        self.assertEqual("That's everything I found on that story for now.", fifth)
+        self.assertEqual(prompts_before, len(local.prompts))
+
+        # Live replay 2026-10-11: the next "Tell me more." fell back to the
+        # old path and repeated the lead.
+        sixth = await _collect_turn(model, "Tell me more.", generation=6)
+
+        self.assertEqual("That's everything I found on that story for now.", sixth)
+        self.assertEqual(prompts_before, len(local.prompts))
+        self.assertEqual(2, len(provider.calls))
+        await model.close()
+
+    def test_restating_a_told_story_is_not_new_detail(self) -> None:
+        # Live replay 2026-10-11: both passed as "new" and sounded repeated.
+        told = _novelty_terms(
+            "US military has disabled a cargo vessel attempting to run the Iran "
+            "blockade in the Gulf of Oman. The US military disabled a Panama-flagged "
+            "cargo ship called the M/V Ocean Molica, also known as the Arika Sun, "
+            "using a precision munition."
+        )
+
+        for repeat in (
+            "The ship was Panama-flagged and named M/V Ocean Molica, also known "
+            "as the \"Arika Sun.\"",
+            "The US military on Saturday said that it has disabled a commercial "
+            "cargo vessel in the Gulf of Oman.",
+            "US military says it disabled cargo vessel trying to run Iran blockade.",
+        ):
+            with self.subTest(repeat=repeat):
+                self.assertFalse(_adds_new_detail(repeat, told))
+        for new in (
+            "It was struck by a fighter jet, which knocked out its propulsion "
+            "without harming the crew.",
+            "Four commercial vessels have been disabled and 135 ships turned around.",
+            "No one was hurt.",
+        ):
+            with self.subTest(new=new):
+                self.assertTrue(_adds_new_detail(new, told))
+
+    async def test_story_source_reports_come_before_general_search(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, ())
+        source = _StorySource(_BLOCKADE_ARTICLE)
+        local = _PromptLanguageModel()
+        model = AsyncRetrievalLanguageModel(local, provider, story_details=source)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        reply = await _collect_turn(
+            model, "Can you tell me more about it?", generation=2
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "US military says it disabled cargo vessel trying to run "
+                    "Iran blockade",
+                    MAX_STORY_PASSAGES,
+                )
+            ],
+            source.calls,
+        )
+        # Only the news question used the general provider.
+        self.assertEqual(1, len(provider.calls))
+        self.assertIn("Panama-flagged", reply)
+        await model.close()
+
+    async def test_story_source_failure_falls_back_to_general_search(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        source = _StorySource((), error=TimeoutError())
+        model = AsyncRetrievalLanguageModel(
+            _PromptLanguageModel(), provider, story_details=source
+        )
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        reply = await _collect_turn(
+            model, "Can you tell me more about it?", generation=2
+        )
+
+        self.assertEqual(1, len(source.calls))
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("Gulf of Oman", reply)
+        await model.close()
+
+    async def test_model_restating_the_story_is_replaced_by_new_reported_detail(
+        self,
+    ) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("US military says it disabled cargo vessel trying to run Iran blockade.",),
+                # Asked for more, a small model restates what it already said.
+                ("The US military disabled a cargo vessel trying to run the Iran blockade.",),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        reply = await _collect_turn(
+            model, "Can you tell me more about it?", generation=2
+        )
+
+        self.assertNotIn("disabled a cargo vessel trying to run", reply)
+        self.assertIn("in the Gulf of Oman after the ship's crew ignored warnings", reply)
+        await model.close()
+
+    async def test_garbled_request_naming_the_outlet_finds_the_story(self) -> None:
+        # Live call 2026-10-11: "curious cows ... certain part of fungi and use
+        # from BBC" fell through to a fresh headline search and repeated it.
+        headlines = (
+            RetrievalResult(
+                "Send us your questions for economist Isabella Weber on inflation",
+                "https://www.theguardian.com/business/isabella-weber-questions",
+                "The Guardian",
+                engine="google news rss",
+            ),
+            RetrievalResult(
+                "Your photos: Curious cows, striking sunsets and autumn fungi",
+                "https://www.bbc.com/news/articles/your-photos-west-midlands",
+                "BBC",
+                engine="google news rss",
+            ),
+        )
+        provider = _NewsThenStoryProvider(headlines, _BLOCKADE_DETAILS)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me the latest news?")
+        await _collect_turn(
+            model,
+            "Can you tell me more about the curious cows, Strikings and certain "
+            "part of fungi and use from BBC?",
+            generation=2,
+        )
+
+        self.assertEqual(
+            "Your photos Curious cows, striking sunsets and autumn fungi",
+            provider.calls[1][0],
+        )
+        await model.close()
+
+    async def test_named_story_that_sounds_like_news_is_a_story_follow_up(
+        self,
+    ) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        reply = await _collect_turn(
+            model, "Tell me more about the Iran blockade news", generation=2
+        )
+
+        self.assertEqual(
+            "US military says it disabled cargo vessel trying to run Iran blockade",
+            provider.calls[1][0],
+        )
+        self.assertIn("Gulf of Oman", reply)
+        await model.close()
+
+    async def test_the_first_one_means_the_first_story_she_said(self) -> None:
+        # Live replay 2026-10-11: only the second feed headline survived into
+        # the spoken answer, and "the first one" picked the unspoken one.
+        headlines = (
+            RetrievalResult(
+                "India's Cockroach Leaders Released as New Delhi Braces for More Protests",
+                "https://www.nytimes.com/2026/10/11/world/asia/india-cockroach.html",
+                "The New York Times",
+                engine="google news rss",
+            ),
+            RetrievalResult(
+                "World condemns deadly Houthi attack on Saudi Arabia's Riyadh airport",
+                "https://www.aljazeera.com/news/2026/10/11/houthi-riyadh-airport",
+                "Al Jazeera",
+                engine="google news rss",
+            ),
+        )
+        provider = _NewsThenStoryProvider(headlines, _BLOCKADE_DETAILS)
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "The world has condemned a deadly Houthi attack on Saudi "
+                    "Arabia's Riyadh airport.",
+                ),
+                ("The attack on the Riyadh airport was condemned by leaders.",),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, provider)
+
+        await _collect_turn(model, "Can you tell me the latest news?")
+        await _collect_turn(model, "Tell me more about the first one.", generation=2)
+
+        self.assertEqual(
+            "World condemns deadly Houthi attack on Saudi Arabia's Riyadh airport",
+            provider.calls[1][0],
+        )
+        await model.close()
+
+    def test_invented_lounging_is_caught_mid_sentence(self) -> None:
+        # Live replay 2026-10-11: "I'm good, thanks—just sitting here listening".
+        self.assertIsNotNone(
+            _FABRICATED_PHYSICAL.search(
+                "I'm good, thanks—just sitting here listening to you."
+            )
+        )
+        self.assertIsNone(
+            _FABRICATED_PHYSICAL.search("Just sit with it for a minute if you need.")
+        )
+
+    async def test_more_news_is_not_more_of_the_last_story(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        await _collect_turn(model, "Tell me more news", generation=2)
+
+        self.assertTrue(is_news_lookup(provider.calls[1][0]))
+        await model.close()
+
+    async def test_returning_to_a_fetched_story_continues_it(self) -> None:
+        provider = _KeyedStoryProvider(
+            _BLOCKADE_HEADLINES,
+            {
+                "US military says it disabled cargo vessel trying to run Iran "
+                "blockade": _BLOCKADE_DETAILS,
+                "Fires lit on streets across France after student protests": (
+                    RetrievalResult(
+                        "Fires lit on streets across France after student protests",
+                        "https://www.bbc.com/news/world-france-protests",
+                        "Students set bins alight in Paris and Lyon after police "
+                        "cleared occupied universities overnight.",
+                    ),
+                ),
+            },
+        )
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        await _collect_turn(model, "Tell me more about the blockade", generation=2)
+        france = await _collect_turn(
+            model, "Tell me more about the France protests", generation=3
+        )
+        back = await _collect_turn(
+            model, "Tell me more about the blockade", generation=4
+        )
+
+        self.assertIn("Paris and Lyon", france)
+        # Back on the blockade: no new search, and its next unsaid detail.
+        self.assertEqual(3, len(provider.calls))
+        self.assertIn("jet struck the stern", back)
+        await model.close()
+
+    async def test_go_on_after_a_personal_story_is_not_the_news_story(
+        self,
+    ) -> None:
+        # The fetched reports stay cached, but once the user moves on to their
+        # own day, "Go on" means their story, not the blockade.
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        local = _PromptLanguageModel()
+        model = AsyncRetrievalLanguageModel(local, provider)
+
+        turns = (
+            "Can you tell me what's the news in US?",
+            "Can you tell me more about it?",
+            "I had a really rough day at work today.",
+            "My boss yelled at me in front of everyone.",
+            "Go on",
+        )
+        for generation, turn in enumerate(turns, start=1):
+            reply = await _collect_turn(model, turn, generation=generation)
+
+        self.assertNotIn("<refs>", local.prompts[-1])
+        self.assertNotIn("blockade", reply)
+        self.assertEqual(2, len(provider.calls))
+        await model.close()
+
+    async def test_story_search_failure_is_honest(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, ())
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        response = await _collect_turn(
+            model, "Can you tell me more about it?", generation=2
+        )
+
+        self.assertIn("couldn't find more details on that story", response)
+        await model.close()
+
+    async def test_more_of_you_is_not_a_story_follow_up(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        local = _PromptLanguageModel()
+        model = AsyncRetrievalLanguageModel(local, provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        await _collect_turn(model, "I want more of you", generation=2)
+
+        self.assertEqual(1, len(provider.calls))
+        self.assertNotIn("<refs>", local.prompts[-1])
+        await model.close()
+
+    async def test_named_story_follow_up_uses_the_matching_headline(self) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me what's the news in US?")
+        await _collect_turn(
+            model, "Tell me more about the France protests", generation=2
+        )
+
+        self.assertEqual(
+            "Fires lit on streets across France after student protests",
+            provider.calls[1][0],
+        )
+        await model.close()
+
+    def test_story_search_query_drops_news_words(self) -> None:
+        query = _story_search_query(
+            "Live Updates: Latest news from Israel, Iran | WATCH"
+        )
+
+        self.assertEqual("from Israel, Iran", query)
+        self.assertFalse(is_news_lookup(query))
 
     async def test_refused_real_headlines_are_read_out_verbatim(self) -> None:
         # Live call 2026-10-03: six real UK headlines came back and the model

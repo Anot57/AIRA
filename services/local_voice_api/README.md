@@ -558,6 +558,7 @@ AIRA_SEARXNG_URL=http://127.0.0.1:8888 \
 AIRA_SEARCH_TIMEOUT_SECONDS=3 \
 AIRA_SEARCH_NEWS_ENGINES= \
 AIRA_NEWS_PROVIDER=google_news_rss \
+AIRA_STORY_DETAILS_PROVIDER=bing_news \
 AIRA_DEBUG_CONVERSATION=1 \
 AIRA_MODEL_WARMUP=1 \
 python services/local_voice_api/tools/run_local_api.py --host 0.0.0.0 --port 18765
@@ -579,6 +580,14 @@ asks the model (74-227 ms) whether a question needs the web, so users do not
 have to say "news" or "today": it returns a search query for current or
 real-world facts and skips small talk, flirting, and stable knowledge. Set
 `AIRA_SEARCH_ROUTER=0` to fall back to keyword routing only.
+`AIRA_STORY_DETAILS_PROVIDER=bing_news` answers "tell me more" about a story
+she already told. The headline (never the user's words) is searched on Bing
+News RSS (free, no key), which returns several outlets' one- or two-sentence
+summaries, and the first readable publisher page among the top reports is
+fetched for its paragraphs (public addresses only, bounded size and time,
+0.6-1.8 s measured). Each follow-up tells only details not yet said, and she
+says so when the story runs out. Leave it unset to fall back to general search
+snippets; Bing and the publishers then receive no story requests.
 `AIRA_DEBUG_CONVERSATION=1` prints transcripts to this
 local terminal only; leave it off whenever anyone else's voice is involved.
 
