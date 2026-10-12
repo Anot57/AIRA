@@ -34,6 +34,7 @@ from local_voice_api.retrieval import (  # noqa: E402
     NewsFeedRetrievalProvider,
     _DEPENDENCY_LANGUAGE,
     _FABRICATED_PHYSICAL,
+    _HelpdeskSentenceFilter,
     _NEEDY_OR_HUMAN_FRAMING,
     _UNKEEPABLE_PROMISE,
     _adds_new_detail,
@@ -1857,6 +1858,55 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("room", reply)
         await model.close()
 
+    async def test_acknowledgement_alone_is_not_the_reply_when_the_rest_was_dropped(
+        self,
+    ) -> None:
+        # Live call 2026-10-12: "Can you tell me something floaty?" got only
+        # "Sure." because every sentence after it was dropped.
+        local = _ChunkedScriptedLanguageModel(
+            (
+                ("Sure.", " I'm lying on my bed watching the clouds float by."),
+                ("Clouds drifting slowly across a summer sky.",),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Can you tell me something floaty?")
+
+        self.assertEqual("Clouds drifting slowly across a summer sky.", reply.strip())
+        self.assertEqual(2, len(local.prompts))
+        await model.close()
+
+    async def test_acknowledgement_is_spoken_with_the_sentence_after_it(
+        self,
+    ) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (
+                (
+                    "Sure.",
+                    " Clouds drift like thoughts on a quiet afternoon.",
+                    " Want another?",
+                ),
+            )
+        )
+        model = AsyncRetrievalLanguageModel(local, _Provider())
+
+        reply = await _collect_turn(model, "Can you tell me something floaty?")
+
+        self.assertEqual(
+            "Sure. Clouds drift like thoughts on a quiet afternoon. Want another?",
+            reply.strip(),
+        )
+        self.assertEqual(1, len(local.prompts))
+        await model.close()
+
+    def test_acknowledgement_that_is_the_whole_reply_is_kept(self) -> None:
+        sentence_filter = _HelpdeskSentenceFilter()
+
+        self.assertEqual("", sentence_filter.feed("Sure. "))
+        self.assertEqual("Sure. ", sentence_filter.finish())
+        self.assertFalse(sentence_filter.withheld_acknowledgement)
+
     async def test_invented_physical_details_are_dropped_mid_reply(self) -> None:
         local = _ChunkedScriptedLanguageModel(
             (
@@ -2305,6 +2355,57 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             _FABRICATED_PHYSICAL.search("Just sit with it for a minute if you need.")
         )
+
+    async def test_rejecting_the_current_story_is_a_fresh_news_lookup(
+        self,
+    ) -> None:
+        # Live call 2026-10-12: "tell me more about the US News, not the China
+        # one" matched "was" and "not" in the story's reports and got more of
+        # that story.
+        details = (
+            *_BLOCKADE_DETAILS,
+            RetrievalResult(
+                "Iran blockade ship crew unharmed",
+                "https://www.reuters.com/world/iran-blockade-crew",
+                "The ship was not carrying weapons, officials said, and nobody "
+                "was hurt.",
+            ),
+        )
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, details)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+        correction = (
+            "But I was asking, can you tell me more about the US News, "
+            "not the Iran one?"
+        )
+
+        await _collect_turn(model, "Can you tell me the news in US?")
+        await _collect_turn(model, "Can you tell me more about it?", generation=2)
+        await _collect_turn(model, correction, generation=3)
+
+        self.assertEqual(3, len(provider.calls))
+        self.assertEqual(correction, provider.calls[2][0])
+        self.assertTrue(is_news_lookup(provider.calls[2][0]))
+        self.assertEqual(("usa",), news_search_terms(correction))
+        await model.close()
+
+    async def test_story_follow_up_with_was_still_continues_the_story(
+        self,
+    ) -> None:
+        provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
+        model = AsyncRetrievalLanguageModel(_PromptLanguageModel(), provider)
+
+        await _collect_turn(model, "Can you tell me the news in US?")
+        await _collect_turn(
+            model,
+            "Tell me more about the Iran blockade, was the cargo ship hit?",
+            generation=2,
+        )
+
+        self.assertEqual(
+            "US military says it disabled cargo vessel trying to run Iran blockade",
+            provider.calls[1][0],
+        )
+        await model.close()
 
     async def test_more_news_is_not_more_of_the_last_story(self) -> None:
         provider = _NewsThenStoryProvider(_BLOCKADE_HEADLINES, _BLOCKADE_DETAILS)
@@ -3058,6 +3159,27 @@ class RetrievalConfigurationTests(unittest.TestCase):
             google_news_feed_url(query, region="IN").endswith(
                 "/rss?hl=en-US&gl=US&ceid=US:en"
             )
+        )
+
+    def test_capitalized_us_is_the_us_edition_and_lowercase_us_a_pronoun(
+        self,
+    ) -> None:
+        # Live call 2026-10-12: "Can you tell me the news in US?" searched
+        # India's edition for the word "us" and found one gold-price headline.
+        for query in (
+            "Can you tell me the news in US?",
+            "latest U.S. news",
+            "USA news today",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(
+                    google_news_feed_url(query, region="IN").endswith(
+                        "/rss?hl=en-US&gl=US&ceid=US:en"
+                    )
+                )
+        self.assertEqual(("us",), news_search_terms("Can you tell me about us?"))
+        self.assertEqual(
+            ("usb", "chargers"), news_search_terms("Any news about USB chargers?")
         )
 
     def test_happening_in_a_country_is_that_editions_digest(self) -> None:

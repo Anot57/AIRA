@@ -553,6 +553,10 @@ _NEWS_FILLER_WORDS = frozenset(
         "heard", "saw", "seen", "read", "know", "get", "got", "want", "say",
         "said", "but", "asked", "ask", "told", "just", "really", "actually",
         "and", "or", "if", "there", "here",
+        # "But I was asking, can you tell me more about the US News, not the
+        # China one?" (live call 2026-10-12): "was" and "not" matched the
+        # story's own reports, so it counted as more of that story.
+        "was", "were", "asking", "more", "not", "no",
         # Adjectives people put in front of "news" (live call 2026-10-03:
         # "what's the fresh news in America").
         "fresh", "hot", "important", "interesting", "good", "bad", "daily",
@@ -605,9 +609,25 @@ def is_news_lookup(query: str) -> bool:
     return bool(_NEWS_FRESHNESS.search(query)) and not _NOT_A_NEWS_LOOKUP.search(query)
 
 
+# Capitalized "US" is the country; lowercase "us" stays a pronoun (live call
+# 2026-10-12: "Can you tell me the news in US?" searched India's edition for
+# the word "us" and found one gold-price headline).
+_US_ABBREVIATION = re.compile(r"\bU\.?S\.?(?:A\.?)?(?![A-Za-z])")
+# Turning away from the story being discussed (live call 2026-10-12: "tell me
+# more about the US News, not the China one"): a fresh lookup, and the
+# rejected story's words are not search terms.
+_REJECTED_STORY = re.compile(
+    r"\b(?:not|instead\s+of)\s+(?:about\s+)?(?:the|that|this|those)\s+"
+    r"(?:[a-z0-9'’-]+\s+){0,2}(?:one|ones|story|stories|news|headlines?)\b|"
+    r"\b(?:different|another|other)\s+(?:story|stories|one|news|headlines?)\b",
+    re.IGNORECASE,
+)
+
+
 def news_search_terms(query: str) -> tuple[str, ...]:
     """Topic words of a news question: "latest Nepal news?" -> ("nepal",)."""
 
+    query = _REJECTED_STORY.sub(" ", _US_ABBREVIATION.sub(" usa ", query))
     terms: list[str] = []
     for token in (t.casefold() for t in _TOPIC_TOKEN.findall(query)):
         if (
@@ -2031,6 +2051,10 @@ class AsyncRetrievalLanguageModel:
                         released_text = True
                         yield tail
                     if not released_text:
+                        if helpdesk_filter.withheld_acknowledgement and not attempt:
+                            # Only "Sure." survived; a second draft can still
+                            # answer, where "Go on." would not.
+                            continue
                         # Every sentence was helpdesk language; speak a short
                         # natural reply rather than nothing.
                         yield _safe_social_fallback(user_query)
@@ -2424,7 +2448,7 @@ class AsyncRetrievalLanguageModel:
         is searched once, then each follow-up takes the next unsaid details.
         """
 
-        if not _MORE_ON_STORY.search(transcript):
+        if not _MORE_ON_STORY.search(transcript) or _REJECTED_STORY.search(transcript):
             return None
         subject = _story_subject_stems(transcript)
         # "Tell me more news" asks for other stories, not more of this one.
@@ -3476,6 +3500,13 @@ def _contains_helpdesk_language(response: str) -> bool:
     )
 
 
+_BARE_ACKNOWLEDGEMENT = re.compile(
+    r"\s*(?:sure(?:\s+thing)?|of\s+course|okay|ok|alright|all\s+right|yeah|yes|"
+    r"absolutely|definitely)[\s.!…,]*",
+    re.IGNORECASE,
+)
+
+
 class _HelpdeskSentenceFilter:
     """Drop whole helpdesk sentences from a reply after its opening is emitted.
 
@@ -3518,6 +3549,24 @@ class _HelpdeskSentenceFilter:
         # The news story being discussed, as its reports state it.
         self._news_terms = news_terms
         self._user_terms = user_terms
+        # An opening "Sure." waits for a sentence that survives; alone it is
+        # no answer (live call 2026-10-12: "Can you tell me something floaty?"
+        # got only "Sure.").
+        self._held_acknowledgement = ""
+        self._dropped_any = False
+        self._withheld = False
+
+    @property
+    def withheld_acknowledgement(self) -> bool:
+        """Only a bare acknowledgement survived; everything after was dropped."""
+
+        return self._withheld
+
+    def _release_held(self) -> str:
+        held, self._held_acknowledgement = self._held_acknowledgement, ""
+        if held:
+            self._released_sentences += 1
+        return held
 
     @property
     def done(self) -> bool:
@@ -3566,30 +3615,59 @@ class _HelpdeskSentenceFilter:
             sentence = self._pending[: match.end()]
             self._pending = self._pending[match.end():]
             if self._keep(sentence):
-                released.append(sentence)
+                if (
+                    self._released_sentences == 0
+                    and not self._held_acknowledgement
+                    and _BARE_ACKNOWLEDGEMENT.fullmatch(sentence)
+                ):
+                    self._held_acknowledgement = sentence
+                    continue
+                released.append(self._release_held() + sentence)
                 self._released_sentences += 1
             elif (replacement := self._replace_fabricated_opening(sentence)):
-                released.append(replacement)
+                released.append(self._release_held() + replacement)
                 self._released_sentences += 1
+            else:
+                self._dropped_any = True
         if self.done:
             self._pending = ""
         # Never hold an unpunctuated run long enough to stall speech.
         elif len(self._pending) > self._MAX_HELD_CHARACTERS:
             remainder, self._pending = self._pending, ""
             if self._keep(remainder):
-                released.append(remainder)
+                released.append(self._release_held() + remainder)
+            else:
+                self._dropped_any = True
         text_out = "".join(released)
         if text_out.strip():
             self._released_any = True
         return text_out
 
     def finish(self) -> str:
+        held = self._held_acknowledgement
+        self._held_acknowledgement = ""
+        tail = self._finish_remainder(released_any=self._released_any or bool(held))
+        if not held:
+            return tail
+        if any(ch.isalnum() for ch in tail):
+            return held + tail
+        if self._dropped_any:
+            # "Sure." and nothing else survived: let the caller ask again.
+            self._withheld = True
+            return ""
+        # The model really did answer with just "Sure.".
+        return held + tail
+
+    def _finish_remainder(self, *, released_any: bool) -> str:
         remainder, self._pending = self._pending, ""
-        if self.done or not self._keep(remainder):
+        if self.done:
+            return ""
+        if not self._keep(remainder):
+            self._dropped_any = True
             return ""
         # A trailing emoji after every sentence was dropped ("...just you.
         # 😊") is not a reply; returning nothing lets the caller fall back.
-        if not self._released_any and not any(ch.isalnum() for ch in remainder):
+        if not released_any and not any(ch.isalnum() for ch in remainder):
             return ""
         stripped = remainder.strip()
         # A final fragment cut off by the token budget ("...I didn't even
@@ -3598,10 +3676,11 @@ class _HelpdeskSentenceFilter:
         # A short fragment ending in an abbreviation ("The U.S.") was cut off;
         # a real sentence ("Lots of people move to the U.S.") is kept.
         words = len(stripped.split())
-        if self._released_any and (
+        if released_any and (
             (words >= 4 and not self._COMPLETE_ENDING.search(stripped))
             or (words < 4 and self._ABBREVIATION_ENDING.search(stripped))
         ):
+            self._dropped_any = True
             return ""
         return remainder
 
