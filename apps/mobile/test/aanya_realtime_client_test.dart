@@ -9,15 +9,97 @@ import 'package:female_voice_ai/features/call/domain/realtime_voice_protocol.dar
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('rejects every non-Aanya companion before opening a socket', () {
-    expect(
-      () => AanyaRealtimeClient(
-        companionId: 'tara',
-        config: _config,
-        connector: _FakeConnector(),
-      ),
-      throwsArgumentError,
+  test('rejects malformed companion IDs before opening a socket', () {
+    for (final companionId in <String>['', 'Tara', '../aanya', 'tara_1']) {
+      expect(
+        () => AanyaRealtimeClient(
+          companionId: companionId,
+          config: _config,
+          connector: _FakeConnector(),
+        ),
+        throwsArgumentError,
+      );
+    }
+  });
+
+  test('starts the session as the chosen companion', () async {
+    final socket = _FakeSocket();
+    final client = AanyaRealtimeClient(
+      companionId: 'tara',
+      config: _config,
+      connector: _FakeConnector()..sockets.add(socket),
+      handshakeTimeout: const Duration(seconds: 30),
+      reconnectDelays: const <Duration>[],
     );
+    addTearDown(() async {
+      client.dispose();
+      await client.shutdownComplete;
+    });
+
+    await client.connect();
+    final start = jsonDecode(socket.sentText.single) as Map<String, Object?>;
+    expect(start['companion'], 'tara');
+
+    socket.sendServerJson(<String, Object?>{
+      ..._sessionReady(),
+      'companion': 'tara',
+      'ai_disclosure': 'Tara is an adult fictional AI companion, not a human.',
+    });
+    await _flushEvents();
+
+    expect(client.state.phase, AanyaRealtimePhase.ready);
+    expect(client.state.aiDisclosure, startsWith('Tara is'));
+  });
+
+  test('refuses a session_ready for a different companion', () async {
+    final socket = _FakeSocket();
+    final client = AanyaRealtimeClient(
+      companionId: 'tara',
+      config: _config,
+      connector: _FakeConnector()..sockets.add(socket),
+      handshakeTimeout: const Duration(seconds: 30),
+      reconnectDelays: const <Duration>[],
+    );
+    addTearDown(() async {
+      client.dispose();
+      await client.shutdownComplete;
+    });
+
+    await client.connect();
+    socket.sendServerJson(_sessionReady());
+    await _flushEvents();
+
+    expect(client.state.phase, AanyaRealtimePhase.error);
+    expect(client.state.sessionId, isNull);
+    expect(socket.closeCode, 1002);
+  });
+
+  test('shows the server reason when a companion voice is not ready', () async {
+    final socket = _FakeSocket();
+    final client = AanyaRealtimeClient(
+      companionId: 'riya',
+      config: _config,
+      connector: _FakeConnector()..sockets.add(socket),
+      handshakeTimeout: const Duration(seconds: 30),
+      reconnectDelays: const <Duration>[],
+    );
+    addTearDown(() async {
+      client.dispose();
+      await client.shutdownComplete;
+    });
+
+    await client.connect();
+    socket.sendServerJson(<String, Object?>{
+      'type': 'fatal_error',
+      'protocol_version': 1,
+      'code': 'voice_not_ready',
+      'message': "Riya's voice isn't ready yet. Try another companion for now.",
+    });
+    await _flushEvents();
+
+    expect(client.state.phase, AanyaRealtimePhase.error);
+    expect(client.state.errorCode, 'voice_not_ready');
+    expect(client.state.statusLabel, contains("Riya's voice isn't ready yet"));
   });
 
   test(

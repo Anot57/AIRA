@@ -20,7 +20,7 @@ from .generation import (
     OPTIONAL_CACHE_OVERRIDES,
     REQUIRED_E_DRIVE_ENVIRONMENT,
 )
-from .companion_personas import build_system_prompt
+from .companion_personas import PERSONAS, build_system_prompt
 from .observability import TurnTiming, current_turn_timing
 from .safety import CRISIS_RESOURCE_RESPONSE, detects_crisis_signal
 from .synthesis import (
@@ -65,18 +65,22 @@ BROAD_NEWS_LLM_MAX_TOKENS = 208
 DEFAULT_LLM_MAX_TOKENS = CASUAL_LLM_MAX_TOKENS
 DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
 
-# Voice references are approved only for Aanya, so only her persona is served
-# here; companion_personas holds all 20 for when their voices are approved.
+# Every companion has a persona; whether she can speak depends on her approved
+# voice reference, which synthesis checks separately.
 AANYA_SYSTEM_PERSONA = build_system_prompt("aanya")
-_PERSONAS = {"aanya": AANYA_SYSTEM_PERSONA}
+_PERSONAS = {companion_id: build_system_prompt(companion_id) for companion_id in PERSONAS}
 _AANYA_NAME_VARIANTS = re.compile(r"\b(?:anna|anya|ana)\b", re.IGNORECASE)
+# The model sometimes labels its reply with the companion's name ("Tara: Hey").
+_COMPANION_LABELS = "|".join(
+    sorted((persona.name.casefold() for persona in PERSONAS.values()), key=len, reverse=True)
+)
 _ANSI_ESCAPE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 _ANY_ROLE_LABEL = re.compile(
-    r"(?i)\b(?:assistant|aanya|user|system)[ \t]*:[ \t]*"
+    rf"(?i)\b(?:assistant|{_COMPANION_LABELS}|user|system)[ \t]*:[ \t]*"
 )
 _ASSISTANT_LABEL = re.compile(
-    r"(?im)^[ \t]*(?:\*\*)?(?:assistant|aanya)(?:\*\*)?[ \t]*:[ \t]*"
+    rf"(?im)^[ \t]*(?:\*\*)?(?:assistant|{_COMPANION_LABELS})(?:\*\*)?[ \t]*:[ \t]*"
 )
 _FOLLOWING_ROLE_LABEL = re.compile(
     r"(?im)^[ \t]*(?:\*\*)?(?:user|system)(?:\*\*)?[ \t]*:[ \t]*"
@@ -300,7 +304,7 @@ def normalize_companion_transcript(companion_id: str, transcript: str) -> str:
 
 
 def get_companion_persona(companion_id: str) -> str:
-    """Return the explicit local persona for a supported approved companion."""
+    """Return the explicit local persona for a catalog companion."""
 
     try:
         return _PERSONAS[companion_id]
@@ -480,7 +484,7 @@ def extract_assistant_response(
         text = _strip_leading_echo(text, system_persona)
         text = _strip_leading_echo(text, transcript)
         text = re.sub(
-            r"(?is)^[ \t]*(?:\*\*)?(?:assistant|aanya)(?:\*\*)?[ \t]*:[ \t]*",
+            rf"(?is)^[ \t]*(?:\*\*)?(?:assistant|{_COMPANION_LABELS})(?:\*\*)?[ \t]*:[ \t]*",
             "",
             text,
             count=1,

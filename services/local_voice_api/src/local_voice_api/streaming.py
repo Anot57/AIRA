@@ -32,12 +32,14 @@ _LOGGER = logging.getLogger(__name__)
 class LeadingSpeakerLabelNormalizer:
     """Canonicalize the first streamed LLM text without emitting blank deltas."""
 
-    _LABELS = ("aanya", "assistant")
     _SEPARATORS = (":", "-", "—")
     _MAX_PREFIX_CHARACTERS = 32
     _MAX_PENDING_WHITESPACE = 32
 
-    def __init__(self) -> None:
+    def __init__(self, companion_name: str = "Aanya") -> None:
+        # Only the active companion's name: "My" must not wait to see whether
+        # it becomes "Myra:".
+        self._LABELS = (companion_name.casefold(), "assistant")
         self._buffer = ""
         self._decided = False
         self._pending_whitespace = ""

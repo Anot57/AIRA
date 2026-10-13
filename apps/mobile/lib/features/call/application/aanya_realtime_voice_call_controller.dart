@@ -101,7 +101,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
        _monotonicNow = monotonicNow ?? (() => _processMonotonicClock.elapsed),
        _wallClockNow = wallClockNow ?? DateTime.now,
        _recoveryDelay = recoveryDelay ?? Future<void>.delayed {
-    if (companionId != AanyaVoiceCallController.supportedCompanionId) {
+    if (!AiraRealtimeProtocol.isCompanionId(companionId)) {
       throw ArgumentError.value(companionId, 'companionId');
     }
     endpointConfig.validate();
@@ -1201,7 +1201,7 @@ final class AanyaRealtimeVoiceCallController extends ChangeNotifier
               userTranscript: _transcript,
               assistantResponse: _response,
               aiDisclosure:
-                  client.state.aiDisclosure ?? 'Aanya is an AI companion.',
+                  client.state.aiDisclosure ?? 'This companion is an AI, not a human.',
               audioUri: Uri(),
               userCreatedAt: _userMessageCreatedAt ?? _wallClockNow(),
               assistantCreatedAt:

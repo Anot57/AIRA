@@ -49,8 +49,9 @@ class _AppShellState extends State<AppShell> {
               MaterialPageRoute<void>(
                 builder: (callContext) {
                   void onEnd() => Navigator.of(callContext).pop();
-                  if (companion.id == 'aanya' &&
-                      widget.aanyaVoiceCallBuilder != null) {
+                  // Every companion gets the live call; the server says so
+                  // plainly if her voice is not approved yet.
+                  if (widget.aanyaVoiceCallBuilder != null) {
                     return widget.aanyaVoiceCallBuilder!(
                       companion: companion,
                       onEnd: onEnd,

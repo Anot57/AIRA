@@ -300,26 +300,27 @@ void main() {
       expect(find.text('Companion profile'), findsOneWidget);
     });
 
-    testWidgets('Tara stays on the mock route and never uses Aanya builder', (
-      tester,
-    ) async {
+    testWidgets('Tara gets the live call route as herself', (tester) async {
       _usePhoneViewport(tester);
       var liveBuilderCalls = 0;
+      Companion? routedCompanion;
 
       await _pumpCatalogApp(
         tester,
         liveBuilder: ({required companion, required onEnd}) {
           liveBuilderCalls += 1;
-          return const SizedBox.shrink();
+          routedCompanion = companion;
+          return const Scaffold(key: Key('injected_live_call'));
         },
       );
 
       await _openCallFor(tester, 'tara');
 
-      expect(find.byType(MockVoiceCallScreen), findsOneWidget);
-      expect(find.text('Mock voice call with Tara'), findsOneWidget);
-      expect(find.byKey(const Key('injected_aanya_live_call')), findsNothing);
-      expect(liveBuilderCalls, 0);
+      expect(find.byKey(const Key('injected_live_call')), findsOneWidget);
+      expect(find.byType(MockVoiceCallScreen), findsNothing);
+      expect(liveBuilderCalls, 1);
+      expect(routedCompanion?.id, 'tara');
+      expect(routedCompanion?.name, 'Tara');
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump();

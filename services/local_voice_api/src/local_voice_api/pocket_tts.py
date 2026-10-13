@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .realtime_protocol import MAX_AUDIO_CHUNK_BYTES
+from .realtime_protocol import MAX_AUDIO_CHUNK_BYTES, ProtocolError
 from .streaming import RealtimeInferenceUnavailableError, SynthesizedAudioChunk
 
 POCKET_TTS_PROVIDER = "pocket_worker"
@@ -35,6 +35,7 @@ POCKET_TTS_ENCODING = "pcm_s16le"
 _MAX_ERROR_BODY_BYTES = 4096
 _MAX_SYNTHESIS_REQUEST_BYTES = 4096
 _TURN_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,119}\Z")
+_VOICE_ID = re.compile(r"[a-z]{1,32}\Z")
 
 
 def _positive_seconds(value: object, label: str) -> float:
@@ -110,8 +111,13 @@ class PocketTtsWorkerConfig:
 class PocketTtsWorkerSynthesizer:
     """Forward real worker chunks without buffering a completed utterance."""
 
-    def __init__(self, config: PocketTtsWorkerConfig | None = None) -> None:
+    def __init__(
+        self, config: PocketTtsWorkerConfig | None = None, *, voice: str = "aanya"
+    ) -> None:
+        if not isinstance(voice, str) or not _VOICE_ID.fullmatch(voice):
+            raise ValueError("Pocket TTS voice must be a companion ID.")
         self.config = config or PocketTtsWorkerConfig.from_environment()
+        self.voice = voice
         self._host, self._port = _worker_endpoint(self.config.worker_url)
         self._state_lock = threading.RLock()
         self._request_lock = asyncio.Lock()
@@ -135,6 +141,29 @@ class PocketTtsWorkerSynthesizer:
         ):
             raise RealtimeInferenceUnavailableError(
                 "Pocket TTS worker reported an unsupported audio format."
+            )
+
+    def loaded_voices(self) -> frozenset[str]:
+        """Companion IDs whose voice state the worker has loaded."""
+
+        voices = self.worker_snapshot().get("voices")
+        if voices is None:
+            # A worker from before per-companion voices holds only Aanya.
+            return frozenset({"aanya"})
+        if not isinstance(voices, list):
+            raise RealtimeInferenceUnavailableError(
+                "Pocket TTS worker reported invalid voices."
+            )
+        return frozenset(voice for voice in voices if isinstance(voice, str))
+
+    async def check_voice(self) -> None:
+        """Refuse a session whose companion has no voice loaded in the worker."""
+
+        if self.voice not in await asyncio.to_thread(self.loaded_voices):
+            raise ProtocolError(
+                "voice_not_ready",
+                "This companion's voice isn't ready yet. Try another companion "
+                "for now.",
             )
 
     def worker_snapshot(self) -> dict[str, object]:
@@ -226,6 +255,7 @@ class PocketTtsWorkerSynthesizer:
                     "request_id": request_id,
                     "generation": generation,
                     "text": request_text,
+                    "voice": self.voice,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),

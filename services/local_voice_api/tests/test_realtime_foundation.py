@@ -33,10 +33,12 @@ from local_voice_api.realtime_protocol import (  # noqa: E402
     ProtocolError,
     ServerEventType,
     SessionStartEvent,
+    ai_disclosure,
     error_event,
     parse_client_event,
     server_event,
 )
+from local_voice_api.companion_personas import PERSONAS  # noqa: E402
 from local_voice_api.realtime_session import (  # noqa: E402
     MIN_SPEECH_AUDIO_BYTES,
     RealtimeSession,
@@ -286,10 +288,28 @@ class RealtimeProtocolTests(unittest.TestCase):
             )
         self.assertEqual("binary_audio_required", raised.exception.code)
 
+    def test_every_catalog_companion_can_start_a_session(self) -> None:
+        for companion_id, persona in PERSONAS.items():
+            with self.subTest(companion=companion_id):
+                event = parse_client_event(
+                    _session_start_payload(companion=companion_id)
+                )
+                self.assertIsInstance(event, SessionStartEvent)
+                self.assertEqual(companion_id, event.companion)
+                session = RealtimeSession("session_test")
+                session.start(companion_id, PcmAudioFormat())
+                self.assertEqual(companion_id, session.companion)
+                self.assertEqual(
+                    f"{persona.name} is an adult fictional AI companion, "
+                    "not a human.",
+                    ai_disclosure(companion_id),
+                )
+        self.assertEqual(AI_DISCLOSURE, ai_disclosure("aanya"))
+
     def test_protocol_version_and_companion_fail_fatally(self) -> None:
         for payload, expected_code in (
             (_session_start_payload(version=2), "unsupported_protocol_version"),
-            (_session_start_payload(companion="tara"), "unsupported_companion"),
+            (_session_start_payload(companion="stranger"), "unsupported_companion"),
         ):
             with self.subTest(expected_code=expected_code):
                 with self.assertRaises(ProtocolError) as raised:
@@ -510,10 +530,10 @@ class RealtimeSessionTests(unittest.TestCase):
                 self.assertEqual(0, session.buffered_audio_bytes)
                 self.assertEqual(0, session.turn_generation)
 
-    def test_invalid_transitions_and_non_aanya_are_never_silently_routed(self) -> None:
+    def test_invalid_transitions_and_unknown_companions_are_never_silently_routed(self) -> None:
         session = RealtimeSession("session_test")
         with self.assertRaises(ProtocolError) as unsupported:
-            session.start("tara", PcmAudioFormat())
+            session.start("stranger", PcmAudioFormat())
         self.assertEqual("unsupported_companion", unsupported.exception.code)
         self.assertTrue(unsupported.exception.fatal)
         self.assertEqual(RealtimeSessionState.CONNECTING, session.state)

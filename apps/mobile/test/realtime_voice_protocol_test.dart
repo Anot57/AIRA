@@ -195,7 +195,7 @@ void main() {
         () => RealtimeServerEventParser.parse(
           jsonEncode(<String, Object?>{
             ..._sessionReady(),
-            'companion': 'tara',
+            'companion': 'Tara!',
           }),
         ),
         _protocolError('unsupported_companion'),

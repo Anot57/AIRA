@@ -123,7 +123,7 @@ final class RealtimeProtocolViolation {
   final int audioSequence;
 }
 
-/// Owns one Aanya-only realtime WebSocket session.
+/// Owns one companion's realtime WebSocket session.
 ///
 /// Whole-WAV HTTP remains implemented by [AanyaVoiceCallController]. This
 /// client is the bounded, cancellation-aware foundation for incremental PCM
@@ -145,15 +145,16 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     ],
     ReconnectDelay? reconnectDelay,
     this.repeatLastReconnectDelay = true,
-  }) : _uri = config.realtimeUri,
+  }) : _companionId = companionId,
+       _uri = config.realtimeUri,
        _connector = connector ?? const IoRealtimeWebSocketConnector(),
        _reconnectDelay = reconnectDelay ?? _defaultReconnectDelay,
        reconnectDelays = List<Duration>.unmodifiable(reconnectDelays) {
-    if (companionId != AiraRealtimeProtocol.companionId) {
+    if (!AiraRealtimeProtocol.isCompanionId(companionId)) {
       throw ArgumentError.value(
         companionId,
         'companionId',
-        'Realtime voice is available only for aanya.',
+        'Realtime voice needs a catalog companion ID.',
       );
     }
     if (handshakeTimeout <= Duration.zero ||
@@ -166,6 +167,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
   }
 
+  final String _companionId;
   final Uri _uri;
   final RealtimeWebSocketConnector _connector;
   final ReconnectDelay _reconnectDelay;
@@ -294,7 +296,7 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     );
 
     try {
-      _sendControl(const RealtimeSessionStartMessage());
+      _sendControl(RealtimeSessionStartMessage(companion: _companionId));
     } on Object catch (error) {
       _debugLog('handshake send failed: ${error.runtimeType}');
       await _handleUnexpectedDisconnect(socket, generation);
@@ -636,6 +638,17 @@ final class AanyaRealtimeClient extends ChangeNotifier {
     }
 
     if (event is RealtimeSessionReadyEvent) {
+      if (event.companion != _companionId) {
+        // Never speak to the user as a different companion than they chose.
+        _protocolFailure(
+          socket,
+          generation,
+          'unsupported_companion',
+          expectedEvent: 'session_ready',
+          receivedEvent: 'session_ready',
+        );
+        return;
+      }
       if (_state.phase != AanyaRealtimePhase.aiStarting ||
           _state.sessionId != null) {
         _protocolFailure(

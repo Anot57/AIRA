@@ -767,6 +767,22 @@ class StreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
                 output += normalizer.finish()
                 self.assertEqual(expected, output)
 
+    def test_label_normalizer_strips_only_the_active_companions_name(self) -> None:
+        cases = (
+            ("Tara", ("Tara: Hey", " there."), "Hey there."),
+            ("Tara", ("Aanya: Hi.",), "Aanya: Hi."),
+            ("Myra", ("My", " day was fun."), "My day was fun."),
+            ("Tara", ("Assistant: ", "Okay."), "Okay."),
+        )
+        for name, deltas, expected in cases:
+            with self.subTest(name=name, deltas=deltas):
+                normalizer = LeadingSpeakerLabelNormalizer(name)
+                output = "".join(normalizer.feed(delta) for delta in deltas)
+                output += normalizer.finish()
+                self.assertEqual(expected, output)
+        # Without the companion's name, "My" goes out at once.
+        self.assertEqual("My", LeadingSpeakerLabelNormalizer("Tara").feed("My"))
+
     def test_chunker_does_not_split_inside_decimal_values(self) -> None:
         cases = (
             "√2 ≈ 1.41421356",

@@ -7,11 +7,14 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = SERVICE_ROOT / "src"
 sys.path.insert(0, str(SOURCE_ROOT))
 
+from local_voice_api import production_realtime  # noqa: E402
+from local_voice_api.companion_personas import build_system_prompt  # noqa: E402
 from local_voice_api.conversation import (  # noqa: E402
     validate_assistant_response,
 )
@@ -21,7 +24,10 @@ from local_voice_api.production_realtime import (  # noqa: E402
 from local_voice_api.realtime_pipeline import (  # noqa: E402
     StreamingRealtimeTurnProcessor,
 )
-from local_voice_api.realtime_protocol import PcmAudioFormat  # noqa: E402
+from local_voice_api.realtime_protocol import (  # noqa: E402
+    PcmAudioFormat,
+    ProtocolError,
+)
 from local_voice_api.realtime_session import (  # noqa: E402
     MIN_SPEECH_AUDIO_BYTES,
     RealtimeSession,
@@ -435,6 +441,45 @@ class ProductionCompositionTests(unittest.TestCase):
             processor._language_model._language_model,
             RetrievalAugmentedLanguageModel,
         )
+
+    def test_companion_without_an_approved_voice_is_never_composed(self) -> None:
+        factory = build_pocket_realtime_processor_factory({})
+
+        with self.assertRaises(ProtocolError) as refused:
+            factory("tara")
+
+        self.assertEqual("voice_not_ready", refused.exception.code)
+        self.assertTrue(refused.exception.fatal)
+        self.assertIn("Tara", refused.exception.message)
+
+    def test_approved_companion_gets_her_own_persona_voice_and_same_safety(
+        self,
+    ) -> None:
+        approvals = dict(production_realtime.APPROVED_VOICE_REFERENCES_BY_ID)
+        approvals["tara"] = approvals["aanya"]
+        factory = build_pocket_realtime_processor_factory(
+            {
+                "AIRA_REALTIME_LLM_PROVIDER": "llama_server",
+                "AIRA_ASYNC_RETRIEVAL": "1",
+            }
+        )
+
+        with mock.patch.object(
+            production_realtime, "APPROVED_VOICE_REFERENCES_BY_ID", approvals
+        ):
+            processor = factory("tara")
+
+        crisis = processor._language_model
+        retrieval = crisis._language_model
+        self.assertIsInstance(crisis, CrisisEscalatingLanguageModel)
+        self.assertEqual("Tara", retrieval._companion_name)
+        self.assertEqual(
+            build_system_prompt("tara"),
+            retrieval._language_model._system_persona,
+        )
+        self.assertEqual("tara", processor._synthesizer.voice)
+        self.assertEqual("tara", processor._companion_id)
+        self.assertTrue(crisis.detects_escalation("I want to end my life"))
 
 
 if __name__ == "__main__":

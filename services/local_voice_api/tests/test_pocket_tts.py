@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import io
 import struct
 import sys
@@ -28,6 +29,7 @@ from local_voice_api.pocket_tts import (  # noqa: E402
 from local_voice_api.realtime_pipeline import (  # noqa: E402
     StreamingRealtimeTurnProcessor,
 )
+from local_voice_api.realtime_protocol import ProtocolError  # noqa: E402
 from local_voice_api.streaming import (  # noqa: E402
     RealtimeInferenceUnavailableError,
 )
@@ -93,7 +95,7 @@ class PocketTtsAdapterTests(unittest.IsolatedAsyncioTestCase):
         runtime = worker_module.PocketTtsRuntime(Path("voice"), Path("cache"))
         runtime._status = "ready"
         runtime._model = _FakeModel()
-        runtime._voice_state = object()
+        runtime._voice_states = {"aanya": object()}
         server = worker_module.PocketTtsWorkerServer(("127.0.0.1", 0), runtime)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
@@ -122,6 +124,63 @@ class PocketTtsAdapterTests(unittest.IsolatedAsyncioTestCase):
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=1)
+
+    async def test_each_companion_is_spoken_in_her_own_loaded_voice(self) -> None:
+        runtime = worker_module.PocketTtsRuntime(Path("voice"), Path("cache"))
+        model = _FakeModel()
+        aanya_state, tara_state = object(), object()
+        runtime._status = "ready"
+        runtime._model = model
+        runtime._voice_states = {"aanya": aanya_state, "tara": tara_state}
+        server = worker_module.PocketTtsWorkerServer(("127.0.0.1", 0), runtime)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        config = PocketTtsWorkerConfig(
+            worker_url=f"http://127.0.0.1:{server.server_address[1]}"
+        )
+        tara = PocketTtsWorkerSynthesizer(config, voice="tara")
+        riya = PocketTtsWorkerSynthesizer(config, voice="riya")
+        try:
+            with mock.patch.object(
+                worker_module, "_tensor_to_pcm16", return_value=b"\x01\x00"
+            ):
+                self.assertEqual(
+                    frozenset({"aanya", "tara"}), tara.loaded_voices()
+                )
+                await tara.check_voice()
+                await tara.start_turn("turn_tara")
+                async for _chunk in tara.synthesize_stream("Hi.", threading.Event()):
+                    pass
+                with self.assertRaises(ProtocolError) as refused:
+                    await riya.check_voice()
+                self.assertEqual("voice_not_ready", refused.exception.code)
+                await riya.start_turn("turn_riya")
+                with self.assertRaises(RealtimeInferenceUnavailableError):
+                    async for _chunk in riya.synthesize_stream(
+                        "Hi.", threading.Event()
+                    ):
+                        pass
+            self.assertEqual([tara_state], [call[0] for call in model.calls])
+        finally:
+            await tara.close()
+            await riya.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+    async def test_worker_without_a_voice_list_still_serves_aanya(self) -> None:
+        synthesizer = PocketTtsWorkerSynthesizer(PocketTtsWorkerConfig())
+        with mock.patch.object(
+            synthesizer, "worker_snapshot", return_value={"status": "ready"}
+        ):
+            self.assertEqual(frozenset({"aanya"}), synthesizer.loaded_voices())
+            await synthesizer.check_voice()
+
+    def test_synthesizer_voice_must_be_a_companion_id(self) -> None:
+        for voice in ("", "Tara", "../aanya", "tara_voice"):
+            with self.subTest(voice=voice):
+                with self.assertRaises(ValueError):
+                    PocketTtsWorkerSynthesizer(PocketTtsWorkerConfig(), voice=voice)
 
     async def test_streams_pcm_chunks_in_order_with_fixed_audio_metadata(self) -> None:
         synthesizer = _FakeWorkerSynthesizer(
@@ -228,7 +287,7 @@ class PocketTtsWorkerTests(unittest.TestCase):
         model = _FakeModel()
         runtime._status = "ready"
         runtime._model = model
-        runtime._voice_state = object()
+        runtime._voice_states = {"aanya": object()}
         return runtime, model
 
     def test_runtime_reuses_model_and_voice_and_admits_fifo_queue(self) -> None:
@@ -294,7 +353,7 @@ class PocketTtsWorkerTests(unittest.TestCase):
         model = _FakeModel()
         runtime._status = "ready"
         runtime._model = model
-        runtime._voice_state = object()
+        runtime._voice_states = {"aanya": object()}
         waiter_errors: list[worker_module.WorkerRequestError] = []
         with mock.patch.object(
             worker_module, "_tensor_to_pcm16", return_value=b"\x01\x00"
@@ -355,6 +414,72 @@ class PocketTtsWorkerTests(unittest.TestCase):
             self.assertEqual(str(voice.resolve()), model.voice_path)
             self.assertEqual("ready", runtime.snapshot()["status"])
             self.assertTrue(runtime.snapshot()["voice_loaded"])
+
+    def test_initialize_loads_only_companion_voices_beside_aanyas(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SERVICE_ROOT) as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            cache.mkdir()
+            for filename in (
+                "aanya_voice.safetensors",
+                "tara_voice.safetensors",
+                "stranger_voice.safetensors",
+                "riya_voice.wav",
+            ):
+                (root / filename).write_bytes(b"safe")
+            model = _FakeModel()
+            loaded: list[str] = []
+            model.get_state_for_audio_prompt = lambda path: loaded.append(
+                Path(path).name
+            )
+            fake_package = SimpleNamespace(
+                TTSModel=SimpleNamespace(load_model=mock.Mock(return_value=model))
+            )
+            runtime = worker_module.PocketTtsRuntime(
+                root / "aanya_voice.safetensors", cache
+            )
+            with (
+                mock.patch.dict(sys.modules, {"pocket_tts": fake_package}),
+                mock.patch.object(
+                    worker_module.importlib.metadata,
+                    "version",
+                    return_value="3.1.0",
+                ),
+            ):
+                runtime.initialize()
+
+            self.assertEqual(
+                ["aanya_voice.safetensors", "tara_voice.safetensors"], loaded
+            )
+            self.assertEqual(["aanya", "tara"], runtime.snapshot()["voices"])
+
+    def test_worker_rejects_a_voice_that_is_not_a_companion(self) -> None:
+        runtime, _model = self._ready_runtime()
+        server = worker_module.PocketTtsWorkerServer(("127.0.0.1", 0), runtime)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=2
+            )
+            body = (
+                b'{"turn_id":"turn_x","request_id":"' + b"a" * 32
+                + b'","text":"Hi.","voice":"../aanya"}'
+            )
+            connection.request(
+                "POST",
+                "/v1/synthesize",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(400, response.status)
+            self.assertIn(b"invalid_voice", response.read())
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
 
 
 class ProductionSelectionTests(unittest.TestCase):

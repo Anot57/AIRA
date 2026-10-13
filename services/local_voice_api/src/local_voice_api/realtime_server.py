@@ -16,12 +16,12 @@ from .realtime_pipeline import (
     UnavailableRealtimeTurnProcessor,
 )
 from .realtime_protocol import (
-    AI_DISCLOSURE,
     ClientEventType,
     PcmAudioFormat,
     ProtocolError,
     ServerEventType,
     SessionStartEvent,
+    ai_disclosure,
     error_event,
     parse_client_event,
     server_event,
@@ -93,7 +93,7 @@ class RealtimeWebSocketHandler:
         websocket: WebSocket,
         *,
         readiness_snapshot: Callable[[], Mapping[str, object]],
-        processor_factory: Callable[[], RealtimeTurnProcessor] = (
+        processor_factory: Callable[[str], RealtimeTurnProcessor] = (
             UnavailableRealtimeTurnProcessor
         ),
         inference_available: bool = False,
@@ -102,7 +102,9 @@ class RealtimeWebSocketHandler:
     ) -> None:
         self._websocket = websocket
         self._readiness_snapshot = readiness_snapshot
-        self._processor = processor_factory()
+        # Built once session_start names the companion: her persona and voice.
+        self._processor_factory = processor_factory
+        self._processor: RealtimeTurnProcessor = UnavailableRealtimeTurnProcessor()
         self._inference_available = inference_available
         self._readiness_probe = readiness_probe
         self._capacity_snapshot = capacity_snapshot
@@ -174,6 +176,7 @@ class RealtimeWebSocketHandler:
                     fatal=True,
                 )
             self._session.start(event.companion, event.audio_format)
+            self._processor = self._processor_factory(event.companion)
             self._session.begin_listening()
             self._log_session_timing("session_start_received")
         except ProtocolError as error:
@@ -222,6 +225,15 @@ class RealtimeWebSocketHandler:
                 if prepare is not None:
                     await prepare()
                     self._log_session_timing("processor_prepared")
+            except ProtocolError as error:
+                # The companion herself cannot be served (her voice is not
+                # loaded); retrying the connection would not change that.
+                await self._send_error(
+                    ProtocolError(error.code, error.message, fatal=True)
+                )
+                self._session.close()
+                await self._websocket.close(code=1008)
+                return False
             except Exception:
                 raw_components = readiness.get("components")
                 components = (
@@ -258,8 +270,8 @@ class RealtimeWebSocketHandler:
             server_event(
                 ServerEventType.SESSION_READY,
                 session_id=self._session.session_id,
-                companion="aanya",
-                ai_disclosure=AI_DISCLOSURE,
+                companion=self._session.companion,
+                ai_disclosure=ai_disclosure(self._session.companion),
                 audio_format=PcmAudioFormat().payload(),
                 readiness=readiness,
                 can_process_turns=can_process_turns,

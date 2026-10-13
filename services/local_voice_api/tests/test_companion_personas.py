@@ -104,6 +104,33 @@ class PersonaPromptTests(unittest.TestCase):
                     # Whole words only: "Riya" is a substring of "Priya".
                     self.assertIsNone(re.search(rf"\b{name}\b", prompt))
 
+    def test_every_companion_talks_about_her_own_skills(self) -> None:
+        all_skills = [skill for persona in PERSONAS.values() for skill in persona.skills]
+
+        self.assertEqual(len(all_skills), len(set(all_skills)))
+        for companion_id, persona in PERSONAS.items():
+            prompt = build_system_prompt(companion_id)
+            with self.subTest(companion=companion_id):
+                self.assertEqual(3, len(persona.skills))
+                for skill in persona.skills:
+                    self.assertIn(skill, prompt)
+                # Skills sit in the identity layer, ahead of every fixed layer.
+                self.assertLess(
+                    prompt.index(persona.skills[-1]), prompt.index(GROUNDING_RULES)
+                )
+
+    def test_skill_topics_match_the_catalog_specialities(self) -> None:
+        expected = {
+            "zara": "technology",
+            "simran": "workouts",
+            "saanvi": "music",
+            "kavya": "books",
+            "sana": "goals",
+        }
+        for companion_id, skill in expected.items():
+            with self.subTest(companion=companion_id):
+                self.assertIn(skill, PERSONAS[companion_id].skills)
+
     def test_safety_grounding_and_output_layers_are_identical_everywhere(self) -> None:
         for companion_id in PERSONAS:
             prompt = build_system_prompt(companion_id)

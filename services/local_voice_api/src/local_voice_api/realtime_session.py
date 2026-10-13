@@ -14,6 +14,7 @@ from .observability import RealtimeLatencyMetrics
 from .realtime_protocol import (
     MAX_AUDIO_CHUNK_BYTES,
     MAX_TURN_AUDIO_BYTES,
+    SUPPORTED_REALTIME_COMPANIONS,
     PcmAudioFormat,
     ProtocolError,
 )
@@ -83,10 +84,10 @@ class RealtimeSession:
 
     def start(self, companion: str, audio_format: PcmAudioFormat) -> None:
         self._require(RealtimeSessionState.CONNECTING)
-        if companion != "aanya":
+        if companion not in SUPPORTED_REALTIME_COMPANIONS:
             raise ProtocolError(
                 "unsupported_companion",
-                "Realtime voice currently supports only companion=aanya.",
+                "Realtime voice supports only the app's catalog companions.",
                 fatal=True,
             )
         self.companion = companion
@@ -136,7 +137,7 @@ class RealtimeSession:
         self._require(RealtimeSessionState.LISTENING)
         # Start at accepted end_of_turn handling, before scanning the bounded
         # PCM buffer, so validation work is not excluded from TTFA.
-        turn_id = f"aanya_rt_{uuid.uuid4().hex}"
+        turn_id = f"{self.companion or 'aanya'}_rt_{uuid.uuid4().hex}"
         metrics = RealtimeLatencyMetrics(turn_id)
         metrics.start_end_of_turn()
         end_of_turn_received_at = time.monotonic()

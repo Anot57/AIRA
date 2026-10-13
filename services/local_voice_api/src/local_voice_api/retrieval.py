@@ -1423,12 +1423,16 @@ class AsyncRetrievalLanguageModel:
         clock: Callable[[], float] = time.monotonic,
         router: LanguageModelSearchRouter | None = None,
         story_details: StoryDetailsSource | None = None,
+        companion_name: str = "Aanya",
     ) -> None:
         if context_ttl_seconds <= 0:
             raise ValueError("Async retrieval context TTL must be positive.")
         if type(max_contexts) is not int or max_contexts <= 0:
             raise ValueError("Async retrieval context bound must be positive.")
         self._language_model = language_model
+        # Labels her lines in the history; another name would read as a
+        # third person in the conversation.
+        self._companion_name = companion_name
         self._provider = provider
         self._router = router
         self._router_warmup: asyncio.Task[None] | None = None
@@ -2148,7 +2152,7 @@ class AsyncRetrievalLanguageModel:
 
         for user_text, aanya_text in history:
             parts.append(f"User: {user_text}\n")
-            parts.append(f"Aanya: {aanya_text}\n")
+            parts.append(f"{self._companion_name}: {aanya_text}\n")
 
         parts.append("\nCurrent turn:\n")
         parts.append(current_prompt)

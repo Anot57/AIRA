@@ -1858,6 +1858,23 @@ class AsyncRetrievalPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("room", reply)
         await model.close()
 
+    async def test_history_labels_replies_with_the_active_companions_name(
+        self,
+    ) -> None:
+        local = _ChunkedScriptedLanguageModel(
+            (("I love how things work.",), ("Gadgets, mostly.",))
+        )
+        model = AsyncRetrievalLanguageModel(
+            local, _Provider(), companion_name="Zara"
+        )
+
+        await _collect_turn(model, "What do you like?")
+        await _collect_turn(model, "Like what?", generation=2)
+
+        self.assertIn("Zara: I love how things work.", local.prompts[1])
+        self.assertNotIn("Aanya:", local.prompts[1])
+        await model.close()
+
     async def test_acknowledgement_alone_is_not_the_reply_when_the_rest_was_dropped(
         self,
     ) -> None:

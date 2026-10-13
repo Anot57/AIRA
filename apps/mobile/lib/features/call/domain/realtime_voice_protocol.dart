@@ -4,7 +4,14 @@ import 'dart:convert';
 /// trusted-local WebSocket service.
 abstract final class AiraRealtimeProtocol {
   static const int version = 1;
-  static const String companionId = 'aanya';
+
+  /// The companion a session starts with when none is named.
+  static const String defaultCompanionId = 'aanya';
+
+  /// Catalog companion IDs are short lowercase names such as "tara"; the
+  /// server decides which of them currently has an approved voice.
+  static bool isCompanionId(String id) => _companionIdPattern.hasMatch(id);
+  static final RegExp _companionIdPattern = RegExp(r'^[a-z]{1,32}$');
   static const String pcmEncoding = 'pcm_s16le';
   static const int sampleRateHz = 16000;
   static const int channels = 1;
@@ -112,7 +119,7 @@ sealed class RealtimeClientMessage {
 
 final class RealtimeSessionStartMessage extends RealtimeClientMessage {
   const RealtimeSessionStartMessage({
-    this.companion = AiraRealtimeProtocol.companionId,
+    this.companion = AiraRealtimeProtocol.defaultCompanionId,
     this.audioFormat = const RealtimeAudioFormat.pcm16Mono16Khz(),
   });
 
@@ -464,7 +471,7 @@ abstract final class RealtimeServerEventParser {
   ) {
     final sessionId = _safeId(json, 'session_id');
     final companion = _requiredString(json, 'companion', maxLength: 32);
-    if (companion != AiraRealtimeProtocol.companionId) {
+    if (!AiraRealtimeProtocol.isCompanionId(companion)) {
       throw const RealtimeProtocolException(
         'unsupported_companion',
         'The realtime session selected an unsupported companion.',

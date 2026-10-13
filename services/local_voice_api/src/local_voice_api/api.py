@@ -703,7 +703,7 @@ def create_app(
     readiness_registry: ReadinessRegistry | None = None,
     warmup_coordinator: WarmupCoordinator | None = None,
     warmup_on_start: bool = False,
-    realtime_processor_factory: Callable[[], RealtimeTurnProcessor] | None = None,
+    realtime_processor_factory: Callable[[str], RealtimeTurnProcessor] | None = None,
     realtime_inference_available: bool = False,
     realtime_readiness_probe: Callable[[], None] | None = None,
     realtime_capacity_snapshot: Callable[[], Mapping[str, object]] | None = None,

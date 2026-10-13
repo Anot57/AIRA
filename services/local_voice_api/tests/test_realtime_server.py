@@ -28,6 +28,7 @@ from local_voice_api.readiness import (  # noqa: E402
 )
 from local_voice_api.realtime_protocol import (  # noqa: E402
     PcmAudioFormat,
+    ProtocolError,
     ServerEventType,
     server_event,
 )
@@ -304,7 +305,7 @@ class RealtimeServerTests(unittest.TestCase):
                 shutdown_callback=None,
                 readiness_registry=registry,
                 warmup_coordinator=warmup,
-                realtime_processor_factory=lambda: selected_processor,
+                realtime_processor_factory=lambda companion: selected_processor,
                 realtime_inference_available=inference_available,
                 realtime_readiness_probe=readiness_probe,
                 realtime_capacity_snapshot=capacity_snapshot,
@@ -722,13 +723,92 @@ class RealtimeServerTests(unittest.TestCase):
                 self.assertEqual(1008, closed.exception.code)
 
             with client.websocket_connect("/v1/realtime") as websocket:
-                websocket.send_json(_session_start(companion="tara"))
+                websocket.send_json(_session_start(companion="stranger"))
                 event = websocket.receive_json()
                 self.assertEqual("fatal_error", event["type"])
                 self.assertEqual("unsupported_companion", event["code"])
                 with self.assertRaises(WebSocketDisconnect) as closed:
                     websocket.receive_json()
                 self.assertEqual(1008, closed.exception.code)
+
+    def _companion_app(self, factory):
+        return api_module.create_app(
+            service=_Service(self.runtime_root / "incoming"),
+            shutdown_callback=None,
+            readiness_registry=_ready_registry(),
+            realtime_processor_factory=factory,
+            realtime_inference_available=True,
+        )
+
+    def test_session_is_built_for_and_discloses_the_chosen_companion(self) -> None:
+        requested: list[str] = []
+        processor = _ImmediateProcessor()
+
+        def factory(companion: str) -> _ImmediateProcessor:
+            requested.append(companion)
+            return processor
+
+        with TestClient(self._companion_app(factory)) as client:
+            with client.websocket_connect("/v1/realtime") as websocket:
+                websocket.send_json(_session_start(companion="tara"))
+                ready = websocket.receive_json()
+                websocket.send_bytes(_meaningful_pcm())
+                websocket.send_json(_control("end_of_turn"))
+                final = websocket.receive_json()
+                websocket.send_json(_control("session_end"))
+
+        self.assertEqual(["tara"], requested)
+        self.assertEqual("session_ready", ready["type"])
+        self.assertEqual("tara", ready["companion"])
+        self.assertEqual(
+            "Tara is an adult fictional AI companion, not a human.",
+            ready["ai_disclosure"],
+        )
+        self.assertTrue(ready["can_process_turns"])
+        self.assertRegex(final["turn_id"], r"\Atara_rt_[0-9a-f]{32}\Z")
+
+    def test_companion_without_an_approved_voice_is_refused_with_a_reason(
+        self,
+    ) -> None:
+        def factory(companion: str):
+            raise ProtocolError(
+                "voice_not_ready",
+                "Tara's voice isn't ready yet. Try another companion for now.",
+                fatal=True,
+            )
+
+        with TestClient(self._companion_app(factory)) as client:
+            with client.websocket_connect("/v1/realtime") as websocket:
+                websocket.send_json(_session_start(companion="tara"))
+                event = websocket.receive_json()
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    websocket.receive_json()
+
+        self.assertEqual("fatal_error", event["type"])
+        self.assertEqual("voice_not_ready", event["code"])
+        self.assertIn("Tara", event["message"])
+        self.assertEqual(1008, closed.exception.code)
+
+    def test_voice_missing_from_the_worker_is_refused_before_session_ready(
+        self,
+    ) -> None:
+        class _VoicelessProcessor(_ImmediateProcessor):
+            async def prepare(self) -> None:
+                raise ProtocolError(
+                    "voice_not_ready", "This companion's voice isn't ready yet."
+                )
+
+        processor = _VoicelessProcessor()
+        with TestClient(self._companion_app(lambda companion: processor)) as client:
+            with client.websocket_connect("/v1/realtime") as websocket:
+                websocket.send_json(_session_start(companion="riya"))
+                event = websocket.receive_json()
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    websocket.receive_json()
+
+        self.assertEqual("fatal_error", event["type"])
+        self.assertEqual("voice_not_ready", event["code"])
+        self.assertEqual(1008, closed.exception.code)
 
     def test_warmup_environment_is_explicit_opt_in(self) -> None:
         self.assertFalse(api_module._model_warmup_enabled({}))

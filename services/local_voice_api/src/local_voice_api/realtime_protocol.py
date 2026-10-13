@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .companion_personas import PERSONAS
+
 PROTOCOL_VERSION = 1
-SUPPORTED_REALTIME_COMPANION = "aanya"
+SUPPORTED_REALTIME_COMPANIONS = frozenset(PERSONAS)
 AI_DISCLOSURE = "Aanya is an adult fictional AI companion, not a human."
 MAX_TEXT_MESSAGE_BYTES = 16 * 1024
 MAX_AUDIO_CHUNK_BYTES = 64 * 1024
@@ -164,10 +166,10 @@ def parse_client_event(raw: str | bytes) -> ClientEvent:
                 "invalid_session_start", "session_start contains unsupported fields."
             )
         companion = payload.get("companion")
-        if companion != SUPPORTED_REALTIME_COMPANION:
+        if not isinstance(companion, str) or companion not in SUPPORTED_REALTIME_COMPANIONS:
             raise ProtocolError(
                 "unsupported_companion",
-                "Realtime voice currently supports only companion=aanya.",
+                "Realtime voice supports only the app's catalog companions.",
                 fatal=True,
             )
         return SessionStartEvent(
@@ -183,6 +185,12 @@ def parse_client_event(raw: str | bytes) -> ClientEvent:
             "invalid_event", f"{event_type.value} contains unsupported fields."
         )
     return ClientEvent(type=event_type, protocol_version=version)
+
+
+def ai_disclosure(companion_id: str) -> str:
+    """The session_ready disclosure, naming the companion actually connected."""
+
+    return f"{PERSONAS[companion_id].name} is an adult fictional AI companion, not a human."
 
 
 def server_event(event_type: ServerEventType, **fields: object) -> dict[str, object]:

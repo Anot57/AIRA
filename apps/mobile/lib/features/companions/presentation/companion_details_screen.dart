@@ -123,9 +123,7 @@ class CompanionDetailsScreen extends StatelessWidget {
                 width: double.infinity,
                 child: Semantics(
                   button: true,
-                  label: companion.id == 'aanya'
-                      ? 'Start a local AI voice call with Aanya'
-                      : 'Start a mock AI voice call with ${companion.name}',
+                  label: 'Start a local AI voice call with ${companion.name}',
                   onTap: onStartVoiceCall,
                   child: ExcludeSemantics(
                     child: FilledButton.icon(

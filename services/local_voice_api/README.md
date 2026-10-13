@@ -226,9 +226,11 @@ and available audio/stage durations. Transcript and audio content are sensitive;
 keep the E drive encrypted at rest and delete test turns when they are no longer
 needed.
 
-Milestone 4C currently has a persona and an approved voice only for `aanya`.
-Name normalization changes the whole-word STT variants `Anna`, `Anya`, and
-`Ana` to `Aanya` only while Aanya is the active companion.
+All 20 catalog companions have a persona (personality plus three skills, in
+`companion_personas.py`), but a companion can be called only once her voice is
+approved (see "Adding a companion voice" below). Name normalization changes the
+whole-word STT variants `Anna`, `Anya`, and `Ana` to `Aanya` only while Aanya
+is the active companion; realtime STT biases toward the active companion's name.
 
 ## Milestone 5A: trusted local HTTP bridge
 
@@ -386,6 +388,44 @@ backend readiness unavailable. `/ready` and each realtime handshake repeat the
 lightweight worker status/format probe, so a worker that exits after warmup is
 not advertised as currently usable. The Qwen HTTP conversation implementation
 is unchanged and remains available as before.
+
+### Adding a companion voice
+
+The Android app opens a live call for every companion. The backend refuses a
+session with a `voice_not_ready` fatal error, which the call screen shows, until
+both gates pass: the companion is in `config/approved_voice_references.json`,
+and the Pocket worker has loaded her `<companion>_voice.safetensors`. Repeat
+these steps per companion (example: `tara`):
+
+1. Generate candidate references on the GPU (WSL, Qwen VoiceDesign). Try a few
+   seeds; each writes `tara_seed_<seed>.wav` and `.json`:
+
+   ```bash
+   source /mnt/e/aira-local-runtime/activate.sh
+   cd /mnt/e/female-voice-ai
+   for seed in 20261013 20261014 20261015; do
+     python services/local_voice_api/tools/generate_voice_reference.py --companion tara --output-dir /mnt/e/aira-local-runtime/generated/voices --seed $seed
+   done
+   ```
+
+2. Listen to the WAVs. Approve one by adding it to
+   `config/approved_voice_references.json`:
+
+   ```json
+   {"companion_id": "tara", "seed": 20261014, "wav_filename": "tara_seed_20261014.wav", "metadata_filename": "tara_seed_20261014.json"}
+   ```
+
+3. Encode every approved voice that has no Pocket state yet (Windows
+   PowerShell, Pocket venv). The tool runs the same provenance checks as
+   synthesis and writes `E:\aira-local-runtime\pocket-tts\tara_voice.safetensors`:
+
+   ```powershell
+   & "E:\aira-local-runtime\venvs\pocket-tts\Scripts\python.exe" E:\female-voice-ai\services\local_voice_api\tools\export_pocket_voice_state.py --all-approved
+   ```
+
+4. Restart the Pocket worker. It loads Aanya's state plus every
+   `<companion>_voice.safetensors` beside it, and `/ready` lists them under
+   `voices`. Restart the backend so it reads the updated approval manifest.
 
 The fixed development topology keeps Pocket on loopback `127.0.0.1:8766`,
 llama-server on loopback `127.0.0.1:8767`, and Aira on `0.0.0.0:18765`.

@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Protocol
 
+from .companion_personas import PERSONAS
 from .conversation import normalize_companion_transcript
 from .observability import (
     RealtimeConversationMonitor,
@@ -65,6 +66,9 @@ class RealtimeTurnProcessor(Protocol):
 class UnavailableRealtimeTurnProcessor:
     """Honest default until production realtime inference adapters are selected."""
 
+    def __init__(self, companion_id: str = "aanya") -> None:
+        del companion_id
+
     async def prepare(self) -> None:
         return None
 
@@ -97,9 +101,14 @@ class StreamingRealtimeTurnProcessor:
         *,
         debug_conversation: bool = False,
         stt_timeout_seconds: float = 30.0,
+        companion_id: str = "aanya",
     ) -> None:
         if stt_timeout_seconds <= 0:
             raise ValueError("Realtime STT timeout must be positive.")
+        if companion_id not in PERSONAS:
+            raise ValueError(f"Unknown companion {companion_id!r}.")
+        self._companion_id = companion_id
+        self._companion_name = PERSONAS[companion_id].name
         self._transcriber = transcriber
         self._language_model = language_model
         self._synthesizer = synthesizer
@@ -111,6 +120,9 @@ class StreamingRealtimeTurnProcessor:
         self._stt_timeout_seconds = stt_timeout_seconds
 
     async def prepare(self) -> None:
+        check_voice = getattr(self._synthesizer, "check_voice", None)
+        if check_voice is not None:
+            await check_voice()
         prepare = getattr(self._language_model, "prepare", None)
         if prepare is not None:
             await prepare()
@@ -175,7 +187,7 @@ class StreamingRealtimeTurnProcessor:
         first_audio = True
         response_characters = 0
         chunker = SpeakableTextChunker(min_characters=12)
-        prefix_normalizer = LeadingSpeakerLabelNormalizer()
+        prefix_normalizer = LeadingSpeakerLabelNormalizer(self._companion_name)
         try:
             self._log_timing(
                 turn,
@@ -264,7 +276,9 @@ class StreamingRealtimeTurnProcessor:
                 raise NoSpeechDetectedError(
                     "Whisper classified this turn as likely non-speech."
                 )
-            normalized = normalize_companion_transcript("aanya", transcript.text)
+            normalized = normalize_companion_transcript(
+                self._companion_id, transcript.text
+            )
             if len(normalized) > MAX_TRANSCRIPT_TEXT_CHARACTERS:
                 mark_stt_terminal("error")
                 raise RuntimeError("Realtime transcript exceeded its safe limit.")

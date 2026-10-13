@@ -26,7 +26,8 @@ typedef AanyaVoiceCallBuilder = Widget Function({
   required VoidCallback onEnd,
 });
 
-/// Continuous Android voice-call screen for Aanya's approved local AI voice.
+/// Continuous Android voice-call screen for a companion's approved local AI
+/// voice.
 class AanyaVoiceCallScreen extends StatefulWidget {
   const AanyaVoiceCallScreen({
     super.key,
@@ -41,11 +42,11 @@ class AanyaVoiceCallScreen extends StatefulWidget {
     required VoidCallback onEnd,
     required AiraApiConfig config,
   }) {
-    if (!AanyaVoiceCallController.supportsCompanion(companion.id)) {
+    if (!AiraRealtimeProtocol.isCompanionId(companion.id)) {
       throw ArgumentError.value(
         companion.id,
         'companion',
-        'The real local voice screen supports only Aanya.',
+        'The real local voice screen needs a catalog companion.',
       );
     }
     return AanyaVoiceCallScreen(
@@ -59,13 +60,13 @@ class AanyaVoiceCallScreen extends StatefulWidget {
         playback: AndroidPcmVoicePlayback(),
         activeCallPlatform: AndroidActiveCallService(),
         // Build with --dart-define=AIRA_BARGE_IN=true to test talking over
-        // Aanya; off until echo cancellation is verified on the phone.
+        // the companion; off until echo cancellation is verified on the phone.
         bargeInEnabled: const bool.fromEnvironment('AIRA_BARGE_IN'),
       ),
     );
   }
 
-  /// Explicit whole-WAV HTTP fallback for local diagnosis.
+  /// Explicit whole-WAV HTTP fallback for local diagnosis (Aanya only).
   static AanyaVoiceCallScreen httpFallback({
     Key? key,
     required Companion companion,
@@ -110,11 +111,11 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
   @override
   void initState() {
     super.initState();
-    if (!AanyaVoiceCallController.supportsCompanion(widget.companion.id)) {
+    if (!AiraRealtimeProtocol.isCompanionId(widget.companion.id)) {
       throw ArgumentError.value(
         widget.companion.id,
         'companion',
-        'The real local voice screen supports only Aanya.',
+        'The real local voice screen needs a catalog companion.',
       );
     }
     WidgetsBinding.instance.addObserver(this);
@@ -230,16 +231,19 @@ class _AanyaVoiceCallScreenState extends State<AanyaVoiceCallScreen>
                   ),
                   if (state.crisisResources.isNotEmpty)
                     _CrisisResourcesBanner(
+                      companionName: widget.companion.name,
                       resources: state.crisisResources,
                       onDismiss: _controller.dismissCrisisResources,
                     ),
                   Expanded(
                     child: _ConversationHistory(
+                      companionName: widget.companion.name,
                       controller: _scrollController,
                       turns: state.turns,
                     ),
                   ),
                   _VoiceControls(
+                    companionName: widget.companion.name,
                     state: state,
                     duration: _callDuration(state),
                     onStartCall: () => unawaited(_startCall()),
@@ -302,7 +306,7 @@ class _CallHeader extends StatelessWidget {
           const SizedBox(width: AppSpacing.xs),
           Semantics(
             image: true,
-            label: 'Portrait of Aanya, a fictional AI companion',
+            label: 'Portrait of ${companion.name}, a fictional AI companion',
             child: ExcludeSemantics(
               child: CircleAvatar(
                 radius: 30,
@@ -405,10 +409,12 @@ class _ConnectionBadge extends StatelessWidget {
 
 class _CrisisResourcesBanner extends StatelessWidget {
   const _CrisisResourcesBanner({
+    required this.companionName,
     required this.resources,
     required this.onDismiss,
   });
 
+  final String companionName;
   final List<RealtimeCrisisResource> resources;
   final VoidCallback onDismiss;
 
@@ -452,7 +458,7 @@ class _CrisisResourcesBanner extends StatelessWidget {
                   ),
                   const SizedBox(height: AppSpacing.xxs),
                   Text(
-                    'Aanya is an AI and can\'t help in an emergency. '
+                    '$companionName is an AI and can\'t help in an emergency. '
                     'Please reach out now:',
                     style: textTheme.bodyMedium?.copyWith(
                       color: colors.onErrorContainer,
@@ -487,8 +493,13 @@ class _CrisisResourcesBanner extends StatelessWidget {
 }
 
 class _ConversationHistory extends StatelessWidget {
-  const _ConversationHistory({required this.controller, required this.turns});
+  const _ConversationHistory({
+    required this.companionName,
+    required this.controller,
+    required this.turns,
+  });
 
+  final String companionName;
   final ScrollController controller;
   final List<ConversationSessionTurn> turns;
 
@@ -508,14 +519,14 @@ class _ConversationHistory extends StatelessWidget {
               ),
               const SizedBox(height: AppSpacing.md),
               Text(
-                'Start the call, then speak naturally when Aanya is listening.',
+                'Start the call, then speak naturally when $companionName is listening.',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.titleMedium
                     ?.copyWith(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: AppSpacing.xs),
               Text(
-                'Turns stay visible only in this screen session. Aanya does '
+                'Turns stay visible only in this screen session. $companionName does '
                 'not have persistent conversation memory yet.',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -554,7 +565,7 @@ class _ConversationHistory extends StatelessWidget {
               const SizedBox(height: AppSpacing.sm),
               _MessageBubble(
                 key: ValueKey('turn-aanya-${turn.turnId}'),
-                speaker: 'Aanya',
+                speaker: companionName,
                 message: turn.assistantResponse,
                 createdAt: turn.assistantCreatedAt,
                 alignRight: false,
@@ -641,6 +652,7 @@ class _MessageBubble extends StatelessWidget {
 
 class _VoiceControls extends StatelessWidget {
   const _VoiceControls({
+    required this.companionName,
     required this.state,
     required this.duration,
     required this.onStartCall,
@@ -650,6 +662,7 @@ class _VoiceControls extends StatelessWidget {
     required this.onInterrupt,
   });
 
+  final String companionName;
   final VoiceCallState state;
   final Duration duration;
   final VoidCallback onStartCall;
@@ -803,7 +816,7 @@ class _VoiceControls extends StatelessWidget {
             ],
             const SizedBox(height: AppSpacing.xs),
             Text(
-              active ? 'The call stays active until you end it.' : 'Aanya is an AI companion, not a human or emergency service.',
+              active ? 'The call stays active until you end it.' : '$companionName is an AI companion, not a human or emergency service.',
               textAlign: TextAlign.center,
               style: theme.textTheme.labelMedium?.copyWith(
                 color: colors.onSurfaceVariant,

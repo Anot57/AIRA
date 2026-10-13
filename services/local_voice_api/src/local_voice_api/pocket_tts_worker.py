@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .profiles import EXPECTED_COMPANION_IDS
+
 SAMPLE_RATE_HZ = 24_000
 CHANNELS = 1
 ENCODING = "pcm_s16le"
@@ -32,6 +34,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
 DEFAULT_RUNTIME_ROOT = Path(r"E:\aira-local-runtime\pocket-tts")
 DEFAULT_VOICE_STATE = DEFAULT_RUNTIME_ROOT / "aanya_voice.safetensors"
+# Other companions' states sit beside Aanya's as "<companion>_voice.safetensors".
+VOICE_STATE_SUFFIX = "_voice.safetensors"
+DEFAULT_VOICE = "aanya"
 DEFAULT_CACHE_ROOT = DEFAULT_RUNTIME_ROOT / "cache"
 
 VOICE_STATE_ENVIRONMENT = "AIRA_POCKET_TTS_VOICE_STATE"
@@ -62,7 +67,7 @@ class _QueuedSynthesis:
 
 
 class PocketTtsRuntime:
-    """Own exactly one model and one cached Aanya state for the process."""
+    """Own exactly one model and each companion's cached voice state."""
 
     def __init__(
         self,
@@ -82,7 +87,7 @@ class PocketTtsRuntime:
         self._status = "starting"
         self._message = "Pocket TTS initialization has not started."
         self._model: Any | None = None
-        self._voice_state: Any | None = None
+        self._voice_states: dict[str, Any] = {}
         self._pocket_tts_version: str | None = None
         self._active_turn_id: str | None = None
         self._active_request_id: str | None = None
@@ -93,7 +98,7 @@ class PocketTtsRuntime:
             if self._status != "starting":
                 return
             self._status = "loading"
-            self._message = "Pocket TTS model and cached Aanya state are loading."
+            self._message = "Pocket TTS model and cached voice states are loading."
         try:
             voice_state = self.voice_state_path.resolve(strict=True)
             cache_root = self.cache_root.resolve(strict=True)
@@ -114,7 +119,16 @@ class PocketTtsRuntime:
                 raise RuntimeError(
                     f"Pocket TTS sample rate {model.sample_rate} is unsupported."
                 )
-            aanya_state = model.get_state_for_audio_prompt(str(voice_state))
+            voice_states = {
+                DEFAULT_VOICE: model.get_state_for_audio_prompt(str(voice_state))
+            }
+            for companion_id, path in companion_voice_state_paths(
+                voice_state.parent
+            ).items():
+                if companion_id not in voice_states:
+                    voice_states[companion_id] = model.get_state_for_audio_prompt(
+                        str(path)
+                    )
             version = importlib.metadata.version("pocket-tts")
         except Exception as error:
             with self._state_lock:
@@ -127,11 +141,15 @@ class PocketTtsRuntime:
 
         with self._state_lock:
             self._model = model
-            self._voice_state = aanya_state
+            self._voice_states = voice_states
             self._pocket_tts_version = version
             self._status = "ready"
-            self._message = "Pocket TTS model and cached Aanya state are ready."
-        _LOGGER.info("Pocket TTS worker ready version=%s", version)
+            self._message = "Pocket TTS model and cached voice states are ready."
+        _LOGGER.info(
+            "Pocket TTS worker ready version=%s voices=%s",
+            version,
+            ",".join(sorted(voice_states)),
+        )
 
     def snapshot(self) -> dict[str, object]:
         with self._state_lock:
@@ -139,7 +157,8 @@ class PocketTtsRuntime:
                 "status": self._status,
                 "message": self._message,
                 "model_loaded": self._model is not None,
-                "voice_loaded": self._voice_state is not None,
+                "voice_loaded": DEFAULT_VOICE in self._voice_states,
+                "voices": sorted(self._voice_states),
                 "pocket_tts_version": self._pocket_tts_version,
                 "sample_rate_hz": SAMPLE_RATE_HZ,
                 "channels": CHANNELS,
@@ -160,13 +179,20 @@ class PocketTtsRuntime:
         request_id: str,
         text: str,
         generation: int = 1,
+        voice: str = DEFAULT_VOICE,
     ) -> Iterator[bytes]:
         with self._state_lock:
-            if self._status != "ready" or self._model is None or self._voice_state is None:
+            if self._status != "ready" or self._model is None or not self._voice_states:
                 raise WorkerRequestError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "model_not_ready",
-                    "Pocket TTS model and Aanya voice state are not ready.",
+                    "Pocket TTS model and voice states are not ready.",
+                )
+            if voice not in self._voice_states:
+                raise WorkerRequestError(
+                    HTTPStatus.NOT_FOUND,
+                    "voice_not_loaded",
+                    "That companion's voice is not loaded in this worker.",
                 )
         queued = _QueuedSynthesis(
             turn_id,
@@ -209,7 +235,7 @@ class PocketTtsRuntime:
             self._active_request_id = request_id
             self._cancel_event = cancel_event
             model = self._model
-            voice_state = self._voice_state
+            voice_state = self._voice_states[voice]
             _LOGGER.info(
                 "[AIRA POCKET TIMING] event=tts_start turn_id=%s generation=%d "
                 "request_id=%s monotonic_us=%d queue_wait_ms=%.3f",
@@ -351,12 +377,20 @@ class PocketTtsRequestHandler(BaseHTTPRequestHandler):
                 "text_too_large",
                 "Synthesis text exceeds the worker limit.",
             )
+        voice = payload.get("voice", DEFAULT_VOICE)
+        if voice not in EXPECTED_COMPANION_IDS:
+            raise WorkerRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_voice",
+                "Synthesis voice must be a companion ID.",
+            )
 
         stream = self.server.runtime.stream_pcm(
             turn_id,
             request_id,
             normalized,
             generation,
+            voice,
         )
         try:
             first_frame = next(stream)
@@ -470,6 +504,17 @@ def _required_identifier(
             f"{key} is invalid.",
         )
     return value
+
+
+def companion_voice_state_paths(voice_dir: Path) -> dict[str, Path]:
+    """Exported voice states in a directory, keyed by companion ID."""
+
+    paths: dict[str, Path] = {}
+    for companion_id in EXPECTED_COMPANION_IDS:
+        candidate = voice_dir / f"{companion_id}{VOICE_STATE_SUFFIX}"
+        if candidate.is_file() and not candidate.is_symlink():
+            paths[companion_id] = candidate
+    return paths
 
 
 def _tensor_to_pcm16(tensor: Any) -> bytes:

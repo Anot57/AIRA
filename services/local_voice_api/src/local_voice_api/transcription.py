@@ -407,6 +407,7 @@ def transcribe_pcm16_audio(
     cpu_threads: int = DEFAULT_CPU_THREADS,
     whisper_model_class: Any | None = None,
     include_diagnostics: bool = False,
+    hotwords: str = HOTWORDS,
 ) -> str | Pcm16TranscriptionResult:
     """Transcribe in-memory little-endian PCM16 for the realtime voice path."""
 
@@ -466,7 +467,7 @@ def transcribe_pcm16_audio(
                     beam_size=BEAM_SIZE,
                     vad_filter=VAD_FILTER,
                     condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-                    hotwords=HOTWORDS,
+                    hotwords=hotwords,
                 )
                 raw_segments = list(segment_generator)
             else:
@@ -477,7 +478,7 @@ def transcribe_pcm16_audio(
                         beam_size=BEAM_SIZE,
                         vad_filter=VAD_FILTER,
                         condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-                        hotwords=HOTWORDS,
+                        hotwords=hotwords,
                     )
                     raw_segments = list(segment_generator)
 

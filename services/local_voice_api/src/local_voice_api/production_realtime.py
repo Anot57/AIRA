@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from functools import partial
 import os
 
+from .approved_references import APPROVED_VOICE_REFERENCES_BY_ID
+from .companion_personas import PERSONAS
 from .conversation import (
     AANYA_SYSTEM_PERSONA,
     DEFAULT_LLAMA_CACHE_DIR,
@@ -13,6 +16,7 @@ from .conversation import (
     DEFAULT_RUNTIME_ROOT,
     configure_runtime_environment,
     generate_local_llm_response,
+    get_companion_persona,
     resolve_cached_llm_model,
 )
 from .llama_server import (
@@ -22,7 +26,7 @@ from .llama_server import (
 from .observability import debug_conversation_enabled
 from .pocket_tts import PocketTtsWorkerConfig, PocketTtsWorkerSynthesizer
 from .realtime_pipeline import RealtimeTurnProcessor, StreamingRealtimeTurnProcessor
-from .realtime_protocol import PcmAudioFormat
+from .realtime_protocol import PcmAudioFormat, ProtocolError
 from .retrieval import (
     SEARCH_ROUTER_PROMPT,
     AsyncRetrievalLanguageModel,
@@ -88,7 +92,7 @@ def _async_retrieval_enabled(
 
 def build_pocket_realtime_processor_factory(
     environ: Mapping[str, str] | None = None,
-) -> Callable[[], RealtimeTurnProcessor]:
+) -> Callable[..., RealtimeTurnProcessor]:
     """Return a cheap per-session factory; the persistent worker owns the model."""
 
     worker_config = PocketTtsWorkerConfig.from_environment(environ)
@@ -114,16 +118,26 @@ def build_pocket_realtime_processor_factory(
     )
     debug_conversation = debug_conversation_enabled(environ)
 
-    def create_processor() -> RealtimeTurnProcessor:
+    def create_processor(companion_id: str = "aanya") -> RealtimeTurnProcessor:
+        # A companion speaks only once a person has approved her voice.
+        if companion_id not in APPROVED_VOICE_REFERENCES_BY_ID:
+            name = PERSONAS[companion_id].name if companion_id in PERSONAS else "This companion"
+            raise ProtocolError(
+                "voice_not_ready",
+                f"{name}'s voice isn't ready yet. Try another companion for now.",
+                fatal=True,
+            )
+        persona = get_companion_persona(companion_id)
+        companion_name = PERSONAS[companion_id].name
         if llama_server_config is not None:
             language_model = LlamaServerStreamingLanguageModel(
                 llama_server_config,
-                system_persona=AANYA_SYSTEM_PERSONA,
+                system_persona=persona,
                 max_tokens=DEFAULT_LLM_MAX_TOKENS,
             )
         else:
             language_model = CompleteResponseStreamingLlmAdapter(
-                _generate_response
+                partial(_generate_response, system_persona=persona)
             )
 
         # The model decides when a question needs the internet, so users do
@@ -146,6 +160,7 @@ def build_pocket_realtime_processor_factory(
                 retrieval_provider,
                 router=router,
                 story_details=story_details,
+                companion_name=companion_name,
             )
             if async_retrieval
             else RetrievalAugmentedLanguageModel(
@@ -155,12 +170,13 @@ def build_pocket_realtime_processor_factory(
 
         return StreamingRealtimeTurnProcessor(
             BoundedBatchStreamingTranscriber(
-                _transcribe_pcm,
+                partial(_transcribe_pcm, hotwords=companion_name),
                 admission=stt_admission,
             ),
             CrisisEscalatingLanguageModel(retrieval_language_model),
-            PocketTtsWorkerSynthesizer(worker_config),
+            PocketTtsWorkerSynthesizer(worker_config, voice=companion_id),
             debug_conversation=debug_conversation,
+            companion_id=companion_id,
         )
 
     create_processor.capacity_snapshot = lambda: {  # type: ignore[attr-defined]
@@ -216,7 +232,7 @@ def build_pocket_tts_readiness_check(
 
 
 def _transcribe_pcm(
-    audio: bytes, audio_format: PcmAudioFormat
+    audio: bytes, audio_format: PcmAudioFormat, *, hotwords: str = "Aanya"
 ) -> FinalTranscriptionResult:
     try:
         result = transcribe_pcm16_audio(
@@ -226,6 +242,7 @@ def _transcribe_pcm(
             model_dir=DEFAULT_RUNTIME_ROOT / "models" / "faster-whisper",
             cpu_threads=DEFAULT_CPU_THREADS,
             include_diagnostics=True,
+            hotwords=hotwords,
         )
         if not isinstance(result, Pcm16TranscriptionResult):
             raise RuntimeError("Realtime STT diagnostics were unavailable.")
@@ -238,14 +255,16 @@ def _transcribe_pcm(
         raise NoSpeechDetectedError(str(error)) from error
 
 
-def _generate_response(transcript: str) -> str:
+def _generate_response(
+    transcript: str, *, system_persona: str = AANYA_SYSTEM_PERSONA
+) -> str:
     runtime_environment = configure_runtime_environment(DEFAULT_RUNTIME_ROOT)
     model_path = resolve_cached_llm_model(
         DEFAULT_LLAMA_CACHE_DIR, runtime_root=DEFAULT_RUNTIME_ROOT
     )
     return generate_local_llm_response(
         transcript,
-        system_persona=AANYA_SYSTEM_PERSONA,
+        system_persona=system_persona,
         llama_cli_path=DEFAULT_LLAMA_CLI_PATH,
         model_path=model_path,
         cache_dir=DEFAULT_LLAMA_CACHE_DIR,
